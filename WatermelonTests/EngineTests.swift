@@ -255,6 +255,50 @@ final class EngineTests: XCTestCase {
         XCTAssertTrue(engine.localAssetIDs(for: LibraryMonthKey(year: 2024, month: 4)).isEmpty)
     }
 
+    func testUpdateCollectionsPreservesUnrelatedMonthsAndSharedMembership() {
+        let engine = makeEngine()
+        let jan = LibraryMonthKey(year: 2024, month: 1)
+        let feb = LibraryMonthKey(year: 2024, month: 2)
+        let ordinary = TestFixtures.snapshot(id: "ordinary", year: 2024, month: 1)
+        let representative = TestFixtures.snapshot(id: "representative", year: 2024, month: 2)
+        let frame = TestFixtures.snapshot(id: "frame", year: 2024, month: 2)
+        reload(engine, [[ordinary], [representative], [representative, frame]])
+        engine.setMonthFileSize(123, for: jan)
+        let removed = engine.updateCollections([.existing(0), .existing(1)],
+            fingerprintsForIDs: TestFixtures.emptyFingerprint,
+            remoteFingerprintsForMonth: TestFixtures.emptyRemoteFingerprints)
+        XCTAssertEqual(removed, [feb])
+        XCTAssertEqual(engine.localAssetIDs(for: feb), ["representative"])
+        XCTAssertEqual(engine.monthFileSizes[jan], 123)
+        let added = engine.updateCollections([.existing(0), .existing(1), .inserted([representative, frame])],
+            fingerprintsForIDs: TestFixtures.emptyFingerprint,
+            remoteFingerprintsForMonth: TestFixtures.emptyRemoteFingerprints)
+        XCTAssertEqual(added, [feb])
+        XCTAssertEqual(engine.localAssetIDs(for: feb), ["representative", "frame"])
+        XCTAssertEqual(engine.monthFileSizes[jan], 123)
+    }
+
+    func testUpdateCollectionsReorderingKeepsSubsequentDeltasAligned() {
+        let engine = makeEngine()
+        let jan = LibraryMonthKey(year: 2024, month: 1)
+        let feb = LibraryMonthKey(year: 2024, month: 2)
+        let first = TestFixtures.snapshot(id: "first", year: 2024, month: 1)
+        let second = TestFixtures.snapshot(id: "second", year: 2024, month: 2)
+        reload(engine, [[first], [second], [second]])
+        engine.setMonthFileSize(123, for: jan)
+        let changed = engine.updateCollections([.existing(2), .existing(0), .existing(1)],
+            fingerprintsForIDs: TestFixtures.emptyFingerprint,
+            remoteFingerprintsForMonth: TestFixtures.emptyRemoteFingerprints)
+        XCTAssertTrue(changed.isEmpty)
+        XCTAssertEqual(engine.monthFileSizes[jan], 123)
+        apply(engine, [TestFixtures.incrementalChange(at: 0, removed: ["second"])])
+        XCTAssertEqual(engine.localAssetIDs(for: feb), ["second"])
+        apply(engine, [TestFixtures.incrementalChange(at: 2, removed: ["second"])])
+        XCTAssertTrue(engine.localAssetIDs(for: feb).isEmpty)
+        XCTAssertEqual(engine.localAssetIDs(for: jan), ["first"])
+        XCTAssertEqual(engine.monthFileSizes[jan], 123)
+    }
+
     // MARK: - eagerlyInsert (Critical Invariant #1)
 
     func testEagerlyInsert_ratifyingPHChange_subsequentRemovalEvicts() {

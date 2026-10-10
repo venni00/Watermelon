@@ -791,7 +791,7 @@ final class RestoreService: @unchecked Sendable {
     }
 
     static func readImportedAsset(_ localID: String, planned: [RemoteAssetResourceInstance]) async throws -> ImportedAssetSnapshot {
-        guard let asset = PHAsset.fetchAssets(withLocalIdentifiers: [localID], options: nil).firstObject else {
+        guard let asset = PHAsset.fetchAssets(withLocalIdentifiers: [localID], options: PhotoLibraryService.makeAssetFetchOptions()).firstObject else {
             throw NSError(domain: PHPhotosErrorDomain, code: PHPhotosError.identifierNotFound.rawValue)
         }
         let service = PhotoLibraryService()
@@ -808,7 +808,7 @@ final class RestoreService: @unchecked Sendable {
                 creationDateMs: asset.creationDate?.millisecondsSinceEpoch))
         }
         guard !instances.isEmpty,
-              let current = PHAsset.fetchAssets(withLocalIdentifiers: [localID], options: nil).firstObject,
+              let current = PHAsset.fetchAssets(withLocalIdentifiers: [localID], options: PhotoLibraryService.makeAssetFetchOptions()).firstObject,
               current.modificationDate == asset.modificationDate else {
             throw NSError(domain: PHPhotosErrorDomain, code: PHPhotosError.operationInterrupted.rawValue)
         }
@@ -1032,7 +1032,7 @@ final class RestoreService: @unchecked Sendable {
     }
 
     private static func restoredAssetDiagnostic(localIdentifier: String) -> String {
-        let result = PHAsset.fetchAssets(withLocalIdentifiers: [localIdentifier], options: nil)
+        let result = PHAsset.fetchAssets(withLocalIdentifiers: [localIdentifier], options: PhotoLibraryService.makeAssetFetchOptions())
         guard let asset = result.firstObject else {
             return "placeholder=\(localIdentifier) fetch=missing"
         }

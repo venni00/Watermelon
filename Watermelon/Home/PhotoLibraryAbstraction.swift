@@ -17,6 +17,11 @@ struct LibraryInitialPayload: Sendable {
     let collections: [[LibraryAssetSnapshot]]
 }
 
+enum LibraryCollectionUpdate {
+    case existing(Int)
+    case inserted([LibraryAssetSnapshot])
+}
+
 struct LibraryChangePayload: Sendable {
     enum CollectionChange: Sendable {
         case incremental(

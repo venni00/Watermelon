@@ -47,7 +47,7 @@ final class HomeDataProcessingWorker: @unchecked Sendable {
 
     private let localIndex = HomeLocalIndexEngine()
     private let remoteIndex = HomeRemoteIndexEngine()
-    private var trackedFetchResults: [PHFetchResult<PHAsset>] = []
+    private var trackedFetchResults: [PhotoLibraryFetchCollection] = []
 
     // Compared against `expectedScope` on stale-detectable queries so callers never
     // receive asset IDs from a scope different from the one they asked under.
@@ -208,8 +208,8 @@ final class HomeDataProcessingWorker: @unchecked Sendable {
             (continuation: CheckedContinuation<(Set<LibraryMonthKey>, MonthGroupingTimeZonePreference, Set<String>), Never>) in
             processingQueue.async {
                 let t0 = CFAbsoluteTimeGetCurrent()
-                let results = self.photoLibraryService.fetchResults(query: scope.photoLibraryQuery)
-                let snapshotsPerCollection = results.map(snapshots(of:))
+                let results = self.photoLibraryService.fetchCollections(query: scope.photoLibraryQuery)
+                let snapshotsPerCollection = results.map { snapshots(of: $0.assets) }
                 let t1 = CFAbsoluteTimeGetCurrent()
                 self.trackedFetchResults = results
                 let fingerprintByAsset = self.fetchAllFingerprints()
@@ -381,11 +381,23 @@ final class HomeDataProcessingWorker: @unchecked Sendable {
             var collectionChanges: [LibraryChangePayload.CollectionChange] = []
             collectionChanges.reserveCapacity(self.trackedFetchResults.count)
             var candidateSnapshotsByID: [String: LibraryAssetSnapshot] = [:]
+            var burstMembershipChanged = false
 
             for index in self.trackedFetchResults.indices {
-                let fetchResult = self.trackedFetchResults[index]
+                let collection = self.trackedFetchResults[index]
+                let fetchResult = collection.assets
                 guard let details = change.changeDetails(for: fetchResult) else { continue }
                 let nextFetchResult = details.fetchResultAfterChanges
+                if case .album = collection.source {
+                    if !details.hasIncrementalChanges {
+                        burstMembershipChanged = true
+                    } else {
+                        let removedBurst = details.removedObjects.contains { $0.burstIdentifier != nil }
+                        let insertedBurst = details.insertedObjects.contains { $0.burstIdentifier != nil }
+                        let changedBurst = details.changedObjects.contains { $0.burstIdentifier != nil }
+                        burstMembershipChanged = burstMembershipChanged || removedBurst || insertedBurst || changedBurst
+                    }
+                }
 
                 let entry: LibraryChangePayload.CollectionChange
                 if details.hasIncrementalChanges {
@@ -426,15 +438,41 @@ final class HomeDataProcessingWorker: @unchecked Sendable {
                 }
 
                 collectionChanges.append(entry)
-                self.trackedFetchResults[index] = nextFetchResult
+                self.trackedFetchResults[index].assets = nextFetchResult
             }
 
             guard !collectionChanges.isEmpty else { return }
-            let changedMonths = self.localIndex.applyChange(
+            var changedMonths = self.localIndex.applyChange(
                 LibraryChangePayload(collectionChanges: collectionChanges),
                 fingerprintsForIDs: self.fetchFingerprintsForIDs,
                 remoteFingerprintsForMonth: self.remoteFingerprintsForMonth
             )
+            if burstMembershipChanged, let scope = self.loadedScope, case .albums(let identifiers) = scope.photoLibraryQuery {
+                let bursts = self.photoLibraryService.fetchBurstCollections(inAlbumIdentifiers: identifiers)
+                let indicesBySource = Dictionary(uniqueKeysWithValues: self.trackedFetchResults.enumerated().map { ($0.element.source, $0.offset) })
+                var nextCollections: [PhotoLibraryFetchCollection] = []
+                var updates: [LibraryCollectionUpdate] = []
+                for (index, collection) in self.trackedFetchResults.enumerated() {
+                    if case .burst = collection.source { continue }
+                    nextCollections.append(collection)
+                    updates.append(.existing(index))
+                }
+                for burst in bursts {
+                    if let index = indicesBySource[burst.source] {
+                        nextCollections.append(self.trackedFetchResults[index])
+                        updates.append(.existing(index))
+                    } else {
+                        let added = snapshots(of: burst.assets)
+                        nextCollections.append(burst)
+                        updates.append(.inserted(added))
+                        for snapshot in added { candidateSnapshotsByID[snapshot.localIdentifier] = snapshot }
+                    }
+                }
+                changedMonths.formUnion(self.localIndex.updateCollections(updates,
+                    fingerprintsForIDs: self.fetchFingerprintsForIDs,
+                    remoteFingerprintsForMonth: self.remoteFingerprintsForMonth))
+                self.trackedFetchResults = nextCollections
+            }
             let candidateIDs = Set(candidateSnapshotsByID.keys)
             let records = (try? self.contentHashIndexRepository.fetchAssetFingerprintRecords(
                 assetIDs: candidateIDs

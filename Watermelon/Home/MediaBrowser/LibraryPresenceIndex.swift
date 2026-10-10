@@ -907,7 +907,7 @@ final class LibraryPresenceIndex: @unchecked Sendable {
                     libraryCount: seededLibraryCount
                 ) else { return nil }
             }
-            let assets = PHAsset.fetchAssets(with: PHFetchOptions())
+            let assets = PHAsset.fetchAssets(with: PhotoLibraryService.makeAssetFetchOptions())
             libraryCount = assets.count
             return Self.shouldScanFullLibrary(
                 requestedCount: ids.count,
@@ -938,7 +938,7 @@ final class LibraryPresenceIndex: @unchecked Sendable {
                 modificationDateByID[asset.localIdentifier] = asset.modificationDate
             }
         } else {
-            PHAsset.fetchAssets(withLocalIdentifiers: Array(ids), options: nil).enumerateObjects { asset, _, stop in
+            PHAsset.fetchAssets(withLocalIdentifiers: Array(ids), options: PhotoLibraryService.makeAssetFetchOptions()).enumerateObjects { asset, _, stop in
                 guard !Task.isCancelled else {
                     cancelled = true
                     stop.pointee = true

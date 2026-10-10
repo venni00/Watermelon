@@ -1112,7 +1112,7 @@ struct BackupParallelExecutor: Sendable {
 
                     let batchAssetsResult = PHAsset.fetchAssets(
                         withLocalIdentifiers: batchAssetIDs,
-                        options: nil
+                        options: PhotoLibraryService.makeAssetFetchOptions()
                     )
                     var batchAssetsByLocalIdentifier: [String: PHAsset] = [:]
                     batchAssetsByLocalIdentifier.reserveCapacity(batchAssetsResult.count)
@@ -1918,7 +1918,7 @@ struct BackupParallelExecutor: Sendable {
 
         let fetchResult = PHAsset.fetchAssets(
             withLocalIdentifiers: monthAssetIDs,
-            options: nil
+            options: PhotoLibraryService.makeAssetFetchOptions()
         )
         guard fetchResult.count == monthAssetIDs.count else { return false }
 

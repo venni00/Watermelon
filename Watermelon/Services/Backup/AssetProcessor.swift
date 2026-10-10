@@ -41,7 +41,7 @@ final class AssetProcessor: Sendable {
         var context = context
         let refetchResult = PHAsset.fetchAssets(
             withLocalIdentifiers: [context.asset.localIdentifier],
-            options: nil
+            options: PhotoLibraryService.makeAssetFetchOptions()
         )
         guard refetchResult.count > 0 else {
             return AssetProcessResult(
@@ -435,7 +435,7 @@ final class AssetProcessor: Sendable {
     }
 
     private func assertAssetUnchanged(_ asset: PHAsset) throws {
-        guard let current = PHAsset.fetchAssets(withLocalIdentifiers: [asset.localIdentifier], options: nil).firstObject,
+        guard let current = PHAsset.fetchAssets(withLocalIdentifiers: [asset.localIdentifier], options: PhotoLibraryService.makeAssetFetchOptions()).firstObject,
               current.modificationDate == asset.modificationDate else {
             try hashIndexRepository.deleteIndexEntries(assetIDs: [asset.localIdentifier])
             throw NSError(domain: PHPhotosErrorDomain, code: PHPhotosError.operationInterrupted.rawValue)

@@ -25,7 +25,7 @@ enum PhotoKitImageLoader {
     static func thumbnail(localIdentifier: String) async -> UIImage? {
         guard let asset = PHAsset.fetchAssets(
             withLocalIdentifiers: [localIdentifier],
-            options: nil
+            options: PhotoLibraryService.makeAssetFetchOptions()
         ).firstObject else { return nil }
         return await thumbnail(
             for: asset,

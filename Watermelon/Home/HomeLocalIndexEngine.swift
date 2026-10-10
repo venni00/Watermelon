@@ -349,6 +349,40 @@ final class HomeLocalIndexEngine: @unchecked Sendable {
         return changedMonths
     }
 
+    func updateCollections(
+        _ collections: [LibraryCollectionUpdate],
+        fingerprintsForIDs: (Set<String>) -> [String: LocalAssetFingerprintRecord],
+        remoteFingerprintsForMonth: (LibraryMonthKey) -> Set<Data>
+    ) -> Set<LibraryMonthKey> {
+        let retainedIndices = Set(collections.compactMap { collection -> Int? in
+            if case .existing(let index) = collection { return index }
+            return nil
+        })
+        var changedMonths = Set<LibraryMonthKey>()
+        for index in trackedCollections.indices where !retainedIndices.contains(index) {
+            _ = applyMembershipDelta(removedIDs: trackedCollections[index].assetIDs, addedIDs: [],
+                changedMonths: &changedMonths)
+        }
+        var nextCollections: [TrackedCollection] = []
+        var insertedSnapshots: [String: LibraryAssetSnapshot] = [:]
+        for collection in collections {
+            switch collection {
+            case .existing(let index):
+                nextCollections.append(trackedCollections[index])
+            case .inserted(let snapshots):
+                let ids = Set(snapshots.map(\.localIdentifier))
+                _ = applyMembershipDelta(removedIDs: [], addedIDs: ids, changedMonths: &changedMonths)
+                nextCollections.append(TrackedCollection(assetIDs: ids))
+                for snapshot in snapshots { insertedSnapshots[snapshot.localIdentifier] = snapshot }
+            }
+        }
+        trackedCollections = nextCollections
+        let refreshIDs = upsertAssets(insertedSnapshots, changedMonths: &changedMonths)
+        refreshFingerprintCache(for: refreshIDs, using: fingerprintsForIDs)
+        recomputeAggregates(for: changedMonths, remoteFingerprintsForMonth: remoteFingerprintsForMonth)
+        return changedMonths
+    }
+
     /// Recompute backed-up count for months whose remote fingerprints changed.
     func refreshBackedUpState(
         affectedMonths: Set<LibraryMonthKey>,

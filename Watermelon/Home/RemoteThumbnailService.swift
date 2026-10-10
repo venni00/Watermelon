@@ -503,7 +503,7 @@ final class RemoteThumbnailService: @unchecked Sendable {
     // the original isn't local (e.g. iCloud-only, not downloaded) so the caller falls back to remote.
     // Local originals are never persisted in OriginalPhotoCache — they're always free to re-fetch.
     func materializeLocalVideo(localIdentifier: String) async -> MaterializedOriginal? {
-        let result = PHAsset.fetchAssets(withLocalIdentifiers: [localIdentifier], options: nil)
+        let result = PHAsset.fetchAssets(withLocalIdentifiers: [localIdentifier], options: PhotoLibraryService.makeAssetFetchOptions())
         guard result.count > 0 else { return nil }
         return await requestLocalVideo(result.object(at: 0))
     }
@@ -512,7 +512,7 @@ final class RemoteThumbnailService: @unchecked Sendable {
         localIdentifier: String,
         validate: (MaterializedLivePhotoPair) async -> Bool
     ) async -> MaterializedLivePhotoPair? {
-        let result = PHAsset.fetchAssets(withLocalIdentifiers: [localIdentifier], options: nil)
+        let result = PHAsset.fetchAssets(withLocalIdentifiers: [localIdentifier], options: PhotoLibraryService.makeAssetFetchOptions())
         guard let asset = result.firstObject else { return nil }
         let resources = PHAssetResource.assetResources(for: asset)
         return await Self.firstUsableLocalLivePhotoPair(

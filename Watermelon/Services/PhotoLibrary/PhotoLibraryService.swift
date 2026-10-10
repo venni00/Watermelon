@@ -14,6 +14,17 @@ enum PhotoLibraryQuery: Equatable, Sendable {
     case albums(Set<String>)
 }
 
+struct PhotoLibraryFetchCollection {
+    enum Source: Hashable {
+        case library
+        case album(String)
+        case burst(String)
+    }
+
+    let source: Source
+    var assets: PHFetchResult<PHAsset>
+}
+
 final class PhotoLibraryService: @unchecked Sendable {
     private let resourceManager = PHAssetResourceManager.default()
 
@@ -188,12 +199,51 @@ final class PhotoLibraryService: @unchecked Sendable {
         PHPhotoLibrary.authorizationStatus(for: .readWrite)
     }
 
+    static func makeAssetFetchOptions() -> PHFetchOptions {
+        let options = PHFetchOptions()
+        // Every burst frame needs its own backup and download identity.
+        options.includeAllBurstAssets = true
+        return options
+    }
+
+    private func fetchBurstMembers(in collection: PHAssetCollection) -> PHFetchResult<PHAsset> {
+        let options = Self.makeAssetFetchOptions()
+        options.predicate = NSPredicate(format: "burstIdentifier != nil")
+        return PHAsset.fetchAssets(in: collection, options: options)
+    }
+
+    private func fetchBurstCollections(
+        in collections: [PHAssetCollection],
+        options: PHFetchOptions,
+        shouldCancel: () -> Bool = { false }
+    ) -> [PhotoLibraryFetchCollection] {
+        var results: [PhotoLibraryFetchCollection] = []
+        var burstIDs = Set<String>()
+        for collection in collections {
+            guard !shouldCancel() else { return [] }
+            // Discover membership without date filters; each expanded frame is filtered separately.
+            let members = fetchBurstMembers(in: collection)
+            for index in 0..<members.count {
+                guard !shouldCancel() else { return [] }
+                guard let burstID = members.object(at: index).burstIdentifier,
+                      burstIDs.insert(burstID).inserted else { continue }
+                results.append(PhotoLibraryFetchCollection(source: .burst(burstID),
+                    assets: PHAsset.fetchAssets(withBurstIdentifier: burstID, options: options)))
+            }
+        }
+        return results
+    }
+
+    func fetchBurstCollections(inAlbumIdentifiers identifiers: Set<String>) -> [PhotoLibraryFetchCollection] {
+        fetchBurstCollections(in: resolveUserAlbumCollections(identifiers), options: Self.makeAssetFetchOptions())
+    }
+
     func fetchAssetsResult(
         ascendingByCreationDate: Bool = false,
         since: Date? = nil,
         mediaFilter: PhotoLibraryMediaFilter = .all
     ) -> PHFetchResult<PHAsset> {
-        let options = PHFetchOptions()
+        let options = Self.makeAssetFetchOptions()
         options.sortDescriptors = [NSSortDescriptor(key: "creationDate", ascending: ascendingByCreationDate)]
         var predicates = [mediaFilter.predicate].compactMap { $0 }
         if let since {
@@ -207,16 +257,21 @@ final class PhotoLibraryService: @unchecked Sendable {
 
     // Invalid album selections produce no content; the caller presents the repair action.
     func fetchResults(query: PhotoLibraryQuery) -> [PHFetchResult<PHAsset>] {
+        fetchCollections(query: query).map(\.assets)
+    }
+
+    func fetchCollections(query: PhotoLibraryQuery) -> [PhotoLibraryFetchCollection] {
         switch query {
         case .library(let filter):
-            return [fetchAssetsResult(mediaFilter: filter)]
+            return [PhotoLibraryFetchCollection(source: .library, assets: fetchAssetsResult(mediaFilter: filter))]
         case .albums(let identifiers):
             guard (try? validateAlbumSelection(identifiers)) != nil else { return [] }
             let collections = resolveUserAlbumCollections(identifiers)
             guard collections.count == identifiers.count else { return [] }
             return collections.map {
-                PHAsset.fetchAssets(in: $0, options: nil)
-            }
+                PhotoLibraryFetchCollection(source: .album($0.localIdentifier),
+                    assets: PHAsset.fetchAssets(in: $0, options: Self.makeAssetFetchOptions()))
+            } + fetchBurstCollections(in: collections, options: Self.makeAssetFetchOptions())
         }
     }
 
@@ -238,21 +293,45 @@ final class PhotoLibraryService: @unchecked Sendable {
             subtype: .albumRegular,
             options: nil
         )
-        let assetOptions = PHFetchOptions()
+        let assetOptions = Self.makeAssetFetchOptions()
         assetOptions.sortDescriptors = [NSSortDescriptor(key: "creationDate", ascending: false)]
 
         var albums: [LocalAlbumDescriptor] = []
         albums.reserveCapacity(collections.count)
+        var frameIDsByBurst: [String: Set<String>] = [:]
         for index in 0 ..< collections.count {
             guard !shouldCancel() else { return [] }
 
             let collection = collections.object(at: index)
             let assets = PHAsset.fetchAssets(in: collection, options: assetOptions)
-            let thumbnailAssetIdentifier = assets.count > 0 ? assets.object(at: 0).localIdentifier : nil
+            let members = fetchBurstMembers(in: collection)
+            var memberIDsByBurst: [String: Set<String>] = [:]
+            for index in 0..<members.count {
+                guard !shouldCancel() else { return [] }
+                let member = members.object(at: index)
+                if let burstID = member.burstIdentifier {
+                    memberIDsByBurst[burstID, default: []].insert(member.localIdentifier)
+                }
+            }
+            var assetCount = assets.count
+            for (burstID, memberIDs) in memberIDsByBurst {
+                guard !shouldCancel() else { return [] }
+                if frameIDsByBurst[burstID] == nil {
+                    let frames = PHAsset.fetchAssets(withBurstIdentifier: burstID, options: Self.makeAssetFetchOptions())
+                    var frameIDs = Set<String>()
+                    for index in 0..<frames.count {
+                        guard !shouldCancel() else { return [] }
+                        frameIDs.insert(frames.object(at: index).localIdentifier)
+                    }
+                    frameIDsByBurst[burstID] = frameIDs
+                }
+                assetCount += frameIDsByBurst[burstID, default: []].subtracting(memberIDs).count
+            }
+            let thumbnailAssetIdentifier = assets.firstObject?.localIdentifier
             albums.append(LocalAlbumDescriptor(
                 localIdentifier: collection.localIdentifier,
                 title: collection.localizedTitle ?? String(localized: "home.localAlbums.untitled"),
-                assetCount: assets.count,
+                assetCount: assetCount,
                 thumbnailAssetIdentifier: thumbnailAssetIdentifier
             ))
         }
@@ -364,25 +443,27 @@ final class PhotoLibraryService: @unchecked Sendable {
     ) -> Bool {
         guard !shouldCancel() else { return false }
         let collections = resolveUserAlbumCollections(albumIdentifiers)
-        // Scoped runs discard older months anyway; filtering here keeps whole albums out of memory.
-        let options = since.map { since -> PHFetchOptions in
-            let options = PHFetchOptions()
+        let options = Self.makeAssetFetchOptions()
+        if let since {
             options.predicate = NSPredicate(format: "creationDate >= %@", since as NSDate)
-            return options
         }
 
         var visitedAssetIDs = Set<String>()
         for collection in collections {
             guard !shouldCancel() else { return false }
-            let assets = PHAsset.fetchAssets(in: collection, options: options)
-            for assetIndex in 0 ..< assets.count {
-                guard !shouldCancel() else { return false }
+            let results = [PHAsset.fetchAssets(in: collection, options: options)]
+                + fetchBurstCollections(in: [collection], options: options, shouldCancel: shouldCancel).map(\.assets)
+            guard !shouldCancel() else { return false }
+            for assets in results {
+                for assetIndex in 0 ..< assets.count {
+                    guard !shouldCancel() else { return false }
 
-                let asset = assets.object(at: assetIndex)
-                guard visitedAssetIDs.insert(asset.localIdentifier).inserted else {
-                    continue
+                    let asset = assets.object(at: assetIndex)
+                    guard visitedAssetIDs.insert(asset.localIdentifier).inserted else {
+                        continue
+                    }
+                    visit(asset)
                 }
-                visit(asset)
             }
         }
 
@@ -391,7 +472,7 @@ final class PhotoLibraryService: @unchecked Sendable {
 
     func fetchAssets(localIdentifiers: Set<String>) -> [PHAsset] {
         guard !localIdentifiers.isEmpty else { return [] }
-        let result = PHAsset.fetchAssets(withLocalIdentifiers: Array(localIdentifiers), options: nil)
+        let result = PHAsset.fetchAssets(withLocalIdentifiers: Array(localIdentifiers), options: PhotoLibraryService.makeAssetFetchOptions())
         var assets: [PHAsset] = []
         assets.reserveCapacity(result.count)
         for index in 0 ..< result.count {

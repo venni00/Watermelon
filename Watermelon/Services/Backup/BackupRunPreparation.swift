@@ -2049,7 +2049,7 @@ struct BackupRunPreparationService: Sendable {
 
     private func loadRetryAssets(from onlyAssetLocalIdentifiers: Set<String>?) -> [PHAsset] {
         guard let retryTargets = onlyAssetLocalIdentifiers else { return [] }
-        let fetched = PHAsset.fetchAssets(withLocalIdentifiers: Array(retryTargets), options: nil)
+        let fetched = PHAsset.fetchAssets(withLocalIdentifiers: Array(retryTargets), options: PhotoLibraryService.makeAssetFetchOptions())
         var retryAssets: [PHAsset] = []
         retryAssets.reserveCapacity(fetched.count)
         for index in 0 ..< fetched.count {

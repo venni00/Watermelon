@@ -48,6 +48,10 @@ iOS 27 的 `RunBackupIntent` 通过 `BackgroundBackupRunner.runOnDemand` 复用�
 
 ## 3. 执行前的本地索引预检查
 
+图库读取统一使用 `PhotoLibraryService.makeAssetFetchOptions()`，包含全部连拍子帧。全图库、相册范围及计数、后台备份、索引重建、浏览器匹配和导入后的资源校验使用相同范围；媒体类型、日期与照片权限限制继续生效。每张子帧独立计算内容指纹和备份进度，连拍组标识不参与去重。已有索引可通过补齐索引或下载预检纳入原先漏读的子帧，无需数据库迁移。
+
+相册可能只保存连拍代表帧的成员关系，因此按 `burstIdentifier` 展开全部子帧，再逐帧应用日期筛选并按本地 ID 去重。普通图库变更继续按增量更新；连拍成员关系变化时只增删对应组的索引集合，保留无关月份及大小缓存。相册计数使用原始成员数量，加上连拍组中未直接列入相册的子帧数量；连拍成员通过 `burstIdentifier != nil` 查询，避免枚举普通照片。`PhotoLibraryBurstIntegrationTests` 在一次性模拟器中生成三帧连拍，验证查询、相册计数、索引重建、导入校验和相册成员变化；需预先授权照片访问并在应用 Documents 目录创建 `RUN_BURST_INTEGRATION`，测试后移除整个测试模拟器。`PhotoLibraryAlbumIntegrationTests` 使用同一开关验证无关月份缓存、跨月子帧、多相册去重、真实还原与计数开销。
+
 执行一开始，`HomeExecutionCoordinator.prepareLocalIndexIfNeeded()` 只做一步本地 hash 索引预检查：
 
 `LocalHashIndexBuildService.buildIndex(for:assetIDs, workerCount: 2, allowNetworkAccess: false)`
