@@ -156,6 +156,150 @@ final class RestoreParallelDownloadTests: XCTestCase {
         XCTAssertEqual(RestoreDownloadPolicy.estimatedBytes(for: hashed + hashed), hashed[0].fileSize)
     }
 
+    func testNextImportOverlapsReadbackButCannotRunThreeImportsAhead() async throws {
+        let client = InMemoryRemoteStorageClient()
+        let names = ["first.jpg", "second.jpg", "third.jpg"]
+        await seed([client], names: names)
+        let readback = RestoreTestLatch()
+        let secondImported = expectation(description: "second import overlaps first readback")
+        let imports = RestoreParallelRecorder()
+        let completions = RestoreParallelRecorder()
+        let service = RestoreService(makeClient: { _, _ in client }, importAsset: { files, _ in
+            let name = try XCTUnwrap(files.first?.0.fileName)
+            await imports.record(name)
+            if name == names[1] { secondImported.fulfill() }
+            return name
+        }, inspectImportedAsset: { id, planned in
+            if id == names[0] { await readback.wait() }
+            return .init(instances: planned, modificationDateMs: nil)
+        })
+        let items = names.map(item)
+        let profile = profile()
+        let task = Task {
+            try await service.restoreItems(items: items, profile: profile, password: "", downloadPolicy: .init(),
+                onItemCompleted: { _, _, result in
+                    await completions.record(try XCTUnwrap(result?.asset.localIdentifier))
+                })
+        }
+        await fulfillment(of: [secondImported], timeout: 3)
+        let before = await imports.names
+        let completedBefore = await completions.names
+        XCTAssertEqual(before, Array(names.prefix(2)))
+        XCTAssertTrue(completedBefore.isEmpty)
+        await readback.open()
+        let restored = try await task.value
+        let completed = await completions.names
+        XCTAssertEqual(completed, names)
+        XCTAssertEqual(restored.map(\.asset.localIdentifier), names)
+    }
+
+    func testCancellationDrainsBothImportedAssetsAndWritesTheirIndexes() async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let repository = ContentHashIndexRepository(databaseManager: try DatabaseManager(databaseURL: directory.appendingPathComponent("index.sqlite")))
+        let client = InMemoryRemoteStorageClient()
+        let names = ["first.jpg", "second.jpg", "third.jpg"]
+        await seed([client], names: names)
+        let readback = RestoreTestLatch()
+        let secondImported = expectation(description: "second asset imported")
+        let completed = RestoreParallelRecorder()
+        let service = RestoreService(makeClient: { _, _ in client }, importAsset: { files, _ in
+            let name = try XCTUnwrap(files.first?.0.fileName)
+            XCTAssertNotEqual(name, names[2])
+            if name == names[1] { secondImported.fulfill() }
+            return name
+        }, inspectImportedAsset: { id, planned in
+            XCTAssertFalse(Task.isCancelled)
+            if id == names[0] { await readback.wait() }
+            return .init(instances: planned, modificationDateMs: 1_000)
+        }, hashIndexRepository: repository)
+        let items = names.map(item)
+        let profile = profile()
+        let task = Task {
+            try await service.restoreItems(items: items, profile: profile, password: "", downloadPolicy: .init(),
+                onItemCompleted: { _, _, result in
+                    let id = try XCTUnwrap(result?.asset.localIdentifier)
+                    XCTAssertNotNil(try repository.fetchAssetHashCaches(assetIDs: [id])[id])
+                    await completed.record(id)
+                })
+        }
+        await fulfillment(of: [secondImported], timeout: 3)
+        task.cancel()
+        await readback.open()
+        do { _ = try await task.value; XCTFail("expected cancellation") } catch is CancellationError {}
+        let completedIDs = await completed.names
+        XCTAssertEqual(completedIDs, Array(names.prefix(2)))
+        XCTAssertEqual(try repository.fetchAssetHashCaches(assetIDs: Set(names)).count, 2)
+        for url in await client.downloadAttemptLocalURLs {
+            XCTAssertFalse(FileManager.default.fileExists(atPath: url.path))
+        }
+    }
+
+    func testCompletionFailureStillFinalizesNextAlreadyImportedAsset() async throws {
+        let client = InMemoryRemoteStorageClient()
+        let names = ["first.jpg", "second.jpg", "third.jpg"]
+        await seed([client], names: names)
+        let inspected = RestoreParallelRecorder()
+        let completed = RestoreParallelRecorder()
+        let service = RestoreService(makeClient: { _, _ in client }, importAsset: { files, _ in
+            let name = try XCTUnwrap(files.first?.0.fileName)
+            XCTAssertNotEqual(name, names[2])
+            return name
+        }, inspectImportedAsset: { id, planned in
+            await inspected.record(id)
+            return .init(instances: planned, modificationDateMs: nil)
+        })
+        do {
+            _ = try await service.restoreItems(items: names.map(item), profile: profile(), password: "", downloadPolicy: .init(),
+                onItemCompleted: { index, _, result in
+                    await completed.record(try XCTUnwrap(result?.asset.localIdentifier))
+                    if index == 1 { throw NSError(domain: "CompletionFixture", code: 1) }
+                })
+            XCTFail("expected completion failure")
+        } catch {
+            XCTAssertEqual((error as NSError).domain, "CompletionFixture")
+        }
+        let inspectedIDs = await inspected.names
+        let completedIDs = await completed.names
+        XCTAssertEqual(inspectedIDs, Array(names.prefix(2)))
+        XCTAssertEqual(completedIDs, Array(names.prefix(2)))
+    }
+
+    func testSecondImportFailureReportsAfterFirstAssetCompletes() async throws {
+        let client = InMemoryRemoteStorageClient()
+        let names = ["first.jpg", "second.jpg"]
+        await seed([client], names: names)
+        let readback = RestoreTestLatch()
+        let secondStarted = expectation(description: "second import attempted")
+        let events = RestoreParallelRecorder()
+        let service = RestoreService(makeClient: { _, _ in client }, importAsset: { files, _ in
+            let name = try XCTUnwrap(files.first?.0.fileName)
+            if name == names[1] {
+                secondStarted.fulfill()
+                throw NSError(domain: "PHPhotosErrorDomain", code: 3302)
+            }
+            return name
+        }, inspectImportedAsset: { _, planned in
+            await readback.wait()
+            return .init(instances: planned, modificationDateMs: nil)
+        })
+        let items = names.map(item)
+        let profile = profile()
+        let task = Task {
+            try await service.restoreItems(items: items, profile: profile, password: "", downloadPolicy: .init(),
+                onItemFailed: { _ in await events.record("failed") },
+                onItemCompleted: { _, _, _ in await events.record("completed") })
+        }
+        await fulfillment(of: [secondStarted], timeout: 3)
+        let before = await events.names
+        XCTAssertTrue(before.isEmpty)
+        await readback.open()
+        do { _ = try await task.value; XCTFail("expected failure") } catch is CancellationError {}
+        let recorded = await events.names
+        XCTAssertEqual(recorded, ["completed", "failed"])
+    }
+
     func testBrowserLinkSharedClientIsLimitedToTwoWorkers() async throws {
         let client = InMemoryRemoteStorageClient()
         let factory = RestoreTestClientFactory([client])

@@ -9,7 +9,7 @@ protocol RestoreItemsServing: Sendable {
         shouldDrain: @escaping @Sendable () -> Bool,
         onTransferState: (@Sendable (BackupTransferState) async -> Void)?,
         onItemFailed: (@Sendable (RestoreItemFailure) async -> Void)?,
-        onItemCompleted: @Sendable (Int, Int, RestoreService.RestoredItem?) async throws -> Void
+        onItemCompleted: @escaping @Sendable (Int, Int, RestoreService.RestoredItem?) async throws -> Void
     ) async throws -> [RestoreService.RestoredItem]
 }
 
@@ -88,7 +88,7 @@ final class DownloadWorkflowHelper {
                     await onTransferState(state)
                 },
                 onItemFailed: onItemFailed,
-                onItemCompleted: { _, _, restoredItem in
+                onItemCompleted: { [hashIndexRepository] _, _, restoredItem in
                     if let restoredItem {
                         if !restoredItem.asset.indexWriteHandled {
                             try await Self.writeHashIndex(

@@ -228,16 +228,16 @@ SMB / WebDAV / S3 / SFTP / OneDrive / Dropbox / Google Drive / BrowserLink 走 `
 4. `DownloadWorkflowHelper.downloadItems(...)`
 5. 每个 item 成功后：
    - `writeHashIndex(...)`
-   - 触发 `refreshLocalIndexAndNotify([assetID])`
+   - 本地索引刷新按 200 ms 合并资产 ID；月份返回前立即刷新余项，包含暂停、停止和失败路径
 
 纯下载和同步补下载统一使用月内预取流水线：
 
 1. `DownloadWorkflowHelper` 启用 2 个下载 worker；每个 worker 复用独立客户端，Browser Link 复用其共享客户端及内部下载限制。下载连接独立于上传连接池。
-2. `OrderedRestorePipeline` 最多保留 2 个下载中或待提交的资产，包括队首；按输入序号依次导入 Photos、检查实际资源、处理本地哈希索引，再触发完成回调。
+2. `OrderedRestorePipeline` 保留最多 2 个下载中或待导入的资产，包括队首；上一张的读回校验和索引写入可与下一张 Photos 导入重叠。导入和校验各自保持串行，最多 2 张进入导入但尚未完成收尾；结果与完成回调保持输入顺序。
 3. 每个资产先下载并校验全部资源；任务允许乱序完成，结果和单项错误按输入顺序交付。已有失败结果时停止继续预取。
-4. 预取预算目标为 256 MiB，完整资产一次预留额度；单项超出目标时独占处理。查询可用空间时额外预留两份最大资产的预计空间及 64 MiB，供导入和实际资源校验使用。清单大小只作为估计，下载完成后用实际大小更新预算；这不是下载过程中的硬字节上限。大小未知的资产不与其他资产同时预取。
-5. `RestoreStagingStore` 使用 `tmp/Restore/<运行 UUID>/<资产序号>/`。提交后删除该项，失败或取消时等待所有下载返回后清理整个运行目录并断开连接；启动时回收前次运行目录。
-6. 直接调用 `RestoreService` 默认保持单 worker，浏览器下载入口保持此默认；首页纯下载和同步补下载显式启用上述策略。
+4. 预取预算目标为 256 MiB，完整资产一次预留额度；读回校验结束前继续保留该资产的预算，空间不足时先等待收尾再调度下一项。单项超出目标时独占处理。查询可用空间时额外预留两份最大资产的预计空间及 64 MiB，供导入和实际资源校验使用。清单大小只作为估计，下载完成后用实际大小更新预算；这不是下载过程中的硬字节上限。大小未知的资产不与其他资产同时预取。
+5. `RestoreStagingStore` 使用 `tmp/Restore/<运行 UUID>/<资产序号>/`。Photos 导入返回后删除该项暂存文件；失败或取消时等待下载退出以及所有已导入项的校验、索引和完成回调，再清理运行目录并断开连接。启动时回收前次运行目录。
+6. 直接调用 `RestoreService` 默认保持单下载 worker，浏览器下载入口保持此默认；各入口均可重叠导入与上一项校验。首页纯下载和同步补下载显式启用 2 个下载 worker，并按 200 ms 合并本地索引刷新。
 
 清单大小不能直接作为空间不足的硬失败依据：队列为空且估计无法通过容量检查时，使用独立、可取消且限时的连接查询远端实际大小，再判断容量。查询失败或大小未知时仅下载当前资产，按实际落盘大小检查剩余导入空间（两份实际资产及 64 MiB）；这条回退路径不预取其他资产。Browser Link 使用共享连接，直接采用单项回退。SHA 校验仍是有哈希资源的完整性依据，避免旧清单大小错误阻断原本可恢复的文件。
 
@@ -257,7 +257,7 @@ SMB / WebDAV / S3 / SFTP / OneDrive / Dropbox / Google Drive / BrowserLink 走 `
 ### 下载阶段
 
 1. 纯下载和 sync 月份下载阶段都以 `matchedCount`（本地月聚合中的 `backedUpCount`）为准
-2. 每个 item 成功后立即刷新本地索引，因此百分比会逐步前进
+2. 每个 item 成功后立即记录恢复结果，本地索引刷新按 200 ms 合并资产 ID，百分比随刷新逐步前进；暂停、停止、失败和月份结束时立即刷新余项，并等待刷新完成
 
 ### 还原资源与身份
 
@@ -278,7 +278,7 @@ SMB / WebDAV / S3 / SFTP / OneDrive / Dropbox / Google Drive / BrowserLink 走 `
    - 已完成上传但未完成下载的 sync 月份会在 paused 终态恢复 continuation 之前重新标记待恢复 asset IDs
 2. 下载阶段：
    - Home 的下载阶段拥有独立的 `ExecutionTerminationControl`
-   - 不取消整个下载 task；`RestoreService` 完成当前队首 remote asset（含其全部 resource、导入和 hash-index 写回），取消后续预取并等待其退出，再清理临时文件；恢复时重新下载未提交项
+   - 不取消整个下载 task；`RestoreService` 完成当前队首 remote asset（含其全部 resource、导入和 hash-index 写回），并等待此前已导入项收尾。取消后续预取并等待其退出，再清理临时文件；恢复时重新下载未提交项
    - 预取取消会中止对应 worker 的独占客户端，重连后也跟踪新客户端，避免 SMB / SFTP 的底层请求阻塞收尾；SMB 进度回调读取线程安全取消标记。Browser Link 共享客户端只取消单次传输
    - 如果当前 asset 已因网络错误失去前进进度，drain 会停止后续 backoff / reconnect，而不是为一个已失败的 attempt 再等待完整恢复窗口
    - Home 会结束正在等待的 remote-index sync generation；后续安全点仍以 termination control 决定 paused / stopped，不把 sync waiter cancellation 当成硬取消

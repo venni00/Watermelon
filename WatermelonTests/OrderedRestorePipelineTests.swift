@@ -196,6 +196,26 @@ final class OrderedRestorePipelineTests: XCTestCase {
         XCTAssertFalse(policy.admits(bytes: .max, reserved: [], available: 1_000))
         XCTAssertEqual(RestoreDownloadPolicy.adding(.max, 1), .max)
     }
+
+    func testFinalizingAssetKeepsItsBudgetUntilNextDownloadCanFit() async throws {
+        let probe = RestorePipelineProbe()
+        let policy = RestoreDownloadPolicy(workerCount: 2, bufferedByteLimit: 10, freeSpaceReserve: 0)
+        try await OrderedRestorePipeline<Int>(policy: policy).run(
+            estimatedBytes: [8, 8], shouldDrain: { false }, availableCapacity: { nil }, byteCount: { _ in 8 },
+            prepare: { index, worker in
+                if index == 1 {
+                    let state = await probe.snapshot()
+                    XCTAssertEqual(state.committed, [0])
+                }
+                await probe.start(index, worker: worker)
+                return index
+            },
+            commit: { _, result in _ = try result.get() },
+            finish: { index in await probe.commit(index) }
+        )
+        let state = await probe.snapshot()
+        XCTAssertEqual(state.committed, [0, 1])
+    }
 }
 
 private enum RestorePipelineTestError: Error { case failed }

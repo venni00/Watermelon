@@ -1359,7 +1359,10 @@ final class HomeExecutionCoordinator {
         if let executionID {
             setExecutionWorkStage(.download, for: executionID)
         }
-        return await downloadHelper.downloadItems(
+        let refreshBatcher = HomeLocalIndexRefreshBatcher { [dataRefresher] ids in
+            await dataRefresher.refreshLocalIndexAndNotify(ids)
+        }
+        let result = await downloadHelper.downloadItems(
             remoteItems,
             context: context,
             incompletePolicy: incompleteDownloadPolicy,
@@ -1373,8 +1376,10 @@ final class HomeExecutionCoordinator {
         ) { [weak self] restoredItem in
             guard let self else { return }
             self.downloadRunProgress.recordRestored(restoredItem.identity, in: month)
-            await self.dataRefresher.refreshLocalIndexAndNotify([restoredItem.asset.localIdentifier])
+            refreshBatcher.enqueue(restoredItem.asset.localIdentifier)
         }
+        await refreshBatcher.flush()
+        return result
     }
 
     nonisolated static func shouldContinueDownloadAfterVerifyFailure(_ error: Error) -> Bool {

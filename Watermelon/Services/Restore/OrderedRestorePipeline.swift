@@ -101,7 +101,8 @@ final class OrderedRestorePipeline<Value: Sendable>: Sendable {
         byteCount: @escaping @Sendable (Value) -> Int64,
         resolveSize: (@Sendable (_ index: Int) async throws -> Int64?)? = nil,
         prepare: @escaping @Sendable (_ index: Int, _ workerID: Int) async throws -> Value,
-        commit: (_ index: Int, _ result: Result<Value, Error>) async throws -> Void
+        commit: (_ index: Int, _ result: Result<Value, Error>) async throws -> Void,
+        finish: ((_ index: Int) async throws -> Void)? = nil
     ) async throws {
         let tasks = Tasks()
         let monitor = Task.detached {
@@ -113,7 +114,8 @@ final class OrderedRestorePipeline<Value: Sendable>: Sendable {
                 do { try await Task.sleep(for: .milliseconds(50)) } catch { return }
             }
         }
-        let outcome: Result<Void, Error> = await withTaskCancellationHandler {
+        var finalizing: [Int] = []
+        var outcome: Result<Void, Error> = await withTaskCancellationHandler {
             var pending: [Int: (workerID: Int, task: Task<Value, Error>)] = [:]
             var idleWorkers = Array(0..<min(max(1, policy.workerCount), 4))
             var nextIndex = 0
@@ -126,6 +128,12 @@ final class OrderedRestorePipeline<Value: Sendable>: Sendable {
                             bytes: estimatedBytes[nextIndex], reserved: reserved, available: availableCapacity()
                         )
                         if needsSizeResolution {
+                            if pending.isEmpty, let index = finalizing.first, let finish {
+                                finalizing.removeFirst()
+                                try await finish(index)
+                                tasks.finish(index)
+                                continue
+                            }
                             if !pending.isEmpty { break }
                             guard resolveSize != nil else { throw CocoaError(.fileWriteOutOfSpace) }
                         }
@@ -162,7 +170,16 @@ final class OrderedRestorePipeline<Value: Sendable>: Sendable {
                     let result = await current.task.result
                     try Task.checkCancellation()
                     try await commit(index, result)
-                    tasks.finish(index)
+                    if let finish {
+                        finalizing.append(index)
+                        if finalizing.count > 1 {
+                            let previous = finalizing.removeFirst()
+                            try await finish(previous)
+                            tasks.finish(previous)
+                        }
+                    } else {
+                        tasks.finish(index)
+                    }
                     pending[index] = nil
                     idleWorkers.append(current.workerID)
                 }
@@ -176,6 +193,14 @@ final class OrderedRestorePipeline<Value: Sendable>: Sendable {
         monitor.cancel()
         await monitor.value
         for task in tasks.cancel() { _ = await task.result }
+        for index in finalizing {
+            do {
+                try await finish?(index)
+            } catch {
+                if case .success = outcome { outcome = .failure(error) }
+            }
+            tasks.finish(index)
+        }
         try outcome.get()
     }
 

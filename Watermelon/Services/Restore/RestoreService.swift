@@ -130,7 +130,7 @@ final class RestoreService: @unchecked Sendable {
         shouldDrain: @escaping @Sendable () -> Bool = { false },
         onTransferState: (@Sendable (BackupTransferState) async -> Void)? = nil,
         onItemFailed: (@Sendable (RestoreItemFailure) async -> Void)? = nil,
-        onItemCompleted: @Sendable (Int, Int, RestoredItem?) async throws -> Void
+        onItemCompleted: @escaping @Sendable (Int, Int, RestoredItem?) async throws -> Void
     ) async throws -> [RestoredItem] {
         guard !items.isEmpty else { return [] }
         try Task.checkCancellation()
@@ -142,6 +142,28 @@ final class RestoreService: @unchecked Sendable {
         let workers = (0..<workerCount).map { _ in RestoreDownloadWorker() }
         let pipeline = OrderedRestorePipeline<PreparedRestoreGroup>(policy: policy)
         var results: [RestoredItem] = []
+        var completions: [Int: Task<RestoredAsset?, Error>] = [:]
+        func completeItem(_ index: Int) async throws {
+            let item = items[index]
+            guard let completion = completions.removeValue(forKey: index) else { return }
+            var restoredItem: RestoredItem?
+            do {
+                if let asset = try await completion.value {
+                    let restored = RestoredItem(identity: item.identity, asset: asset)
+                    results.append(restored)
+                    restoredItem = restored
+                }
+            } catch {
+                guard let onItemFailed, Self.isItemLocalFailure(error) else { throw error }
+                await onItemFailed(RestoreItemFailure(
+                    identity: item.identity,
+                    displayName: item.instances.first?.fileName ?? String(item.identity.hexString.prefix(12)),
+                    reason: error.localizedDescription
+                ))
+                throw CancellationError()
+            }
+            try await onItemCompleted(index + 1, items.count, restoredItem)
+        }
         let outcome: Result<Void, Error>
         do {
             try await pipeline.run(
@@ -162,16 +184,15 @@ final class RestoreService: @unchecked Sendable {
                 },
                 commit: { [self] index, result in
                     let item = items[index]
-                    var restoredItem: RestoredItem?
                     do {
                         let prepared = try result.get()
                         defer { prepared.removeFiles() }
-                        if let asset = try await importGroup(prepared.group, downloaded: prepared.downloaded, itemIdentity: item.identity) {
-                            let restored = RestoredItem(identity: item.identity, asset: asset)
-                            results.append(restored)
-                            restoredItem = restored
-                        }
+                        completions[index] = try await importGroup(
+                            prepared.group, downloaded: prepared.downloaded,
+                            itemIdentity: item.identity, after: completions[index - 1]
+                        )
                     } catch {
+                        if index > 0 { try await completeItem(index - 1) }
                         guard let onItemFailed, Self.isItemLocalFailure(error) else { throw error }
                         await onItemFailed(RestoreItemFailure(
                             identity: item.identity,
@@ -180,8 +201,8 @@ final class RestoreService: @unchecked Sendable {
                         ))
                         throw CancellationError()
                     }
-                    try await onItemCompleted(index + 1, items.count, restoredItem)
-                }
+                },
+                finish: completeItem
             )
             outcome = .success(())
         } catch {
@@ -378,8 +399,9 @@ final class RestoreService: @unchecked Sendable {
     private func importGroup(
         _ group: RestoreGroup,
         downloaded: [(RemoteAssetResourceInstance, URL)],
-        itemIdentity: Data
-    ) async throws -> RestoredAsset? {
+        itemIdentity: Data,
+        after previous: Task<RestoredAsset?, Error>?
+    ) async throws -> Task<RestoredAsset?, Error> {
         let acceptedDownloaded = Self.acceptedDownloadedResources(from: downloaded)
         do {
             try Task.checkCancellation()
@@ -388,12 +410,13 @@ final class RestoreService: @unchecked Sendable {
             let localID = try await importAsset(acceptedDownloaded, group.creationDate)
             print("[RestoreService]   saveToPhotoLibrary succeeded, localID=\(localID ?? "nil")")
 
-            guard let localID else { return nil }
+            guard let localID else { return Task.detached { nil } }
             let planned = acceptedDownloaded.map(\.0)
             let repository = hashIndexRepository
             let inspect = inspectImportedAsset
             // Finish persistence even if the caller stops after Photos has committed the asset.
-            return try await Task.detached(priority: .userInitiated) {
+            return Task.detached(priority: .userInitiated) {
+                _ = await previous?.result
                 guard let inspect else {
                     return RestoredAsset(localIdentifier: localID, importedInstances: planned)
                 }
@@ -410,11 +433,16 @@ final class RestoreService: @unchecked Sendable {
                     return RestoredAsset(localIdentifier: localID, importedInstances: snapshot.instances,
                         indexWriteHandled: repository != nil, isCompleteRestore: complete)
                 } catch {
-                    guard repository != nil else { throw error }
+                    guard repository != nil else {
+                        if Self.isSkippablePhotoLibraryImportError(error) {
+                            throw RestorePhotoLibraryImportFailure(underlying: error)
+                        }
+                        throw error
+                    }
                     print("[RestoreService] imported asset verification deferred: \(localID), \(error)")
                     return RestoredAsset(localIdentifier: localID, importedInstances: [], indexWriteHandled: true)
                 }
-            }.value
+            }
         } catch {
             print("[RestoreService]   saveToPhotoLibrary FAILED: \(error)")
             print("[RestoreService]   saveToPhotoLibrary error detail: \(Self.diagnosticDescription(of: error))")

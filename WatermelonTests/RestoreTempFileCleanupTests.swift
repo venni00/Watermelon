@@ -492,7 +492,7 @@ private final class DrainObservingRestoreService: RestoreItemsServing, @unchecke
         shouldDrain: @escaping @Sendable () -> Bool,
         onTransferState _: (nonisolated(nonsending) @Sendable (BackupTransferState) async -> Void)?,
         onItemFailed _: (nonisolated(nonsending) @Sendable (RestoreItemFailure) async -> Void)?,
-        onItemCompleted _: nonisolated(nonsending) @Sendable (Int, Int, RestoreService.RestoredItem?) async throws -> Void
+        onItemCompleted _: @escaping (nonisolated(nonsending) @Sendable (Int, Int, RestoreService.RestoredItem?) async throws -> Void)
     ) async throws -> [RestoreService.RestoredItem] {
         XCTAssertEqual(downloadPolicy.workerCount, 2)
         if shouldDrain() {
