@@ -765,6 +765,8 @@ final class MediaBrowserActionRunner {
         }
 
         await withExecutionLease(on: presenter) {
+            let hud = HUD.show(String(localized: "mediaBrowser.action.deletingRemote"), on: presenter)
+            defer { hud.dismiss() }
             // The remote loop emits many snapshot changes; coalesce their observer notifications until resume.
             self.env.presenceIndex.suspendUpstreamRefresh()
             defer { self.env.presenceIndex.resumeUpstreamRefresh() }
@@ -862,7 +864,7 @@ final class MediaBrowserActionRunner {
             var remoteDeleteFailed = false
             if !remoteItems.isEmpty {
                 if let profile, let password {
-                    let hud = HUD.show(self.deletingProgressText(0, remoteItems.count), on: presenter)
+                    hud.update(self.deletingProgressText(0, remoteItems.count))
                     var completed = 0
                     var failed = 0
                     var skippedForAccess = 0
@@ -909,7 +911,6 @@ final class MediaBrowserActionRunner {
                         completed += 1
                         hud.update(self.deletingProgressText(completed, remoteItems.count))
                     }
-                    hud.dismiss()
                     NotificationCenter.default.post(name: .RemoteLibrarySnapshotDidChange, object: nil)
                     // Surface a partial failure (the single-item delete does too) so the user isn't left thinking
                     // every backup item was removed when some remote deletes errored.
