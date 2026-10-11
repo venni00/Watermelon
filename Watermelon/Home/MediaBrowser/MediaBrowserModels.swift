@@ -239,18 +239,10 @@ enum BatchActionResolver {
         var showsDelete: Bool { deviceCount > 0 || remoteCount > 0 }
     }
 
-    static func resolve(_ items: [MediaBrowserItem]) -> Result {
-        guard !items.isEmpty else {
-            return Result(showsUpload: false, showsDownload: false, deviceCount: 0, remoteCount: 0)
-        }
-        // Upload/Download availability mirrors the executors' own guards (a local-only item is uploadable; a
-        // remote-only item with a fingerprint is downloadable) so the button can't show for a no-op batch.
-        return Result(
-            showsUpload: items.allSatisfy { $0.presence == .localOnly },
-            showsDownload: items.allSatisfy { $0.presence == .remoteOnly },
-            deviceCount: items.filter(\.isDeviceDeletable).count,
-            remoteCount: items.filter(\.isRemoteDeletable).count
-        )
+    static func resolve(_ items: some Sequence<MediaBrowserItem>) -> Result {
+        var summary = MediaBrowserSelectionSummary()
+        for item in items { summary.include(item, selected: true) }
+        return summary.actions
     }
 }
 
@@ -379,6 +371,24 @@ struct MediaBrowserSnapshot: Sendable {
         itemIndexByID[id]
     }
 
+    func items(inDisplayOrderFor ids: Set<MediaBrowserItemID>) -> [MediaBrowserItem] {
+        guard !ids.isEmpty else { return [] }
+        // Small selections avoid a full-library scan; large selections avoid sorting.
+        if ids.count < itemCount / 2 {
+            return ids.compactMap { itemIndexByID[$0] }
+                .sorted()
+                .compactMap { item(at: $0) }
+        }
+        var selected: [MediaBrowserItem] = []
+        selected.reserveCapacity(min(ids.count, itemCount))
+        for section in sections {
+            for item in section.items where ids.contains(item.id) {
+                selected.append(item)
+            }
+        }
+        return selected
+    }
+
     func changedItemIDs(comparedTo previous: MediaBrowserSnapshot) -> Set<MediaBrowserItemID> {
         Set(itemIndexByID.keys.compactMap { id in
             guard let current = item(id: id),
@@ -392,14 +402,16 @@ struct MediaBrowserSnapshot: Sendable {
 @MainActor
 final class MediaBrowserSession {
     private(set) var revision: UInt64 = 0
-    private(set) var snapshot = MediaBrowserSnapshot.empty
+    let selection = MediaBrowserSelection()
+    var snapshot: MediaBrowserSnapshot { selection.snapshot }
 
     func replace(with snapshot: MediaBrowserSnapshot) {
         revision &+= 1
-        self.snapshot = snapshot
+        selection.replaceSnapshot(snapshot)
     }
 
     func reset() {
+        selection.exit()
         replace(with: .empty)
     }
 }

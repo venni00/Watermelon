@@ -186,6 +186,8 @@
 - 本地 PHAsset 不建立 app-owned localIdentifier key，也不维护 alias；只有缺少 current fingerprint 或校验失败的本地项停留在 PhotoKit 系统缓存，不得污染旧 fingerprint。
 - Photo Library 变化由 Media Browser 的 PHChange observer 重建数据，并用不可被普通 reload 覆盖的 generation latch 刷新可见 cell；刷新保留旧图直到新 PhotoKit 请求完成，不同步清空整屏。PhotoKit 负责本地缩略图缓存及资源变化后的请求结果，app 不再维护 local cache generation 或重渲染循环。
 - Grid 与 Viewer 共享当前模式的一份 `MediaBrowserSession` 连续快照；Viewer 固定打开时的页序，只按 id / local lineage 从最新 session 解析页面，并用小型 action overlay 承接尚未进入快照的本次操作结果。切换模式会释放旧快照，不预存 Local / All / Remote 三套 sections。item identity 由本地 `localIdentifier` 或远端 `(assetFingerprint, storageMonth)` 构造，不能由调用方拼接字符串。
+- `MediaBrowserSession` 持有 `MediaBrowserSelection`，后者统一拥有当前 snapshot、选择模式、选中 ID、增量统计、按显示顺序的惰性缓存和拖选范围。替换 snapshot 同步裁剪选择并重算能力；单项变化只增减统计，拖选只处理范围差集，不复制完整基线。Grid 不直接写 ID 集合，Viewer 继续只读 session 快照。
+- `MediaBrowserCollectionSelection` 将业务选择投影到可见 UICollectionView 路径；`MediaBrowserCollectionView` 在 UIKit 完成布局与复用后触发校正。系统双指手势期间保留已访问路径，结束后清理离屏路径。全选不会把整个图库登记成 UIKit 选中项，布局回调不扫描完整业务选择。
 - `MediaBrowserSource.load()` 返回 `.loaded(content)` / `.stale` / `.cancelled`；stale 不得折成 empty 覆盖现有 UI。远端投影同时保留 storage month（路径/删除）与按当前时区算出的 display month；Remote/Merged 共用这次计算。Merged 让 Local 只创建 remote presence 中不存在的条目，再按 display month 线性合并，不构建两份子 snapshot，也不维护 fast/fallback 两套规则。最终 snapshot 接管 source 的分段 item buffers 并以 section offsets 分页，不再 flatten 全库复制。
 
 ### Drop Mode

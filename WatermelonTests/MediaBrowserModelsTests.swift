@@ -262,6 +262,59 @@ final class MediaBrowserModelsTests: XCTestCase {
         XCTAssertEqual(snapshot().itemIDs(inSection: 0), [remote.id])
     }
 
+    func testSelectAllKeepsDisplayOrderAcrossMonthsAndRemoteTwins() {
+        let first = localItem("z", isBackedUp: false)
+        let last = localItem("a", isBackedUp: true)
+        let januaryRemote = remoteItem(fingerprint: Data([2]), localIdentifier: nil)
+        let february = LibraryMonthKey(year: 2024, month: 2)
+        let februaryRemote = MediaBrowserItem(kind: .photo, creationDateMs: 1, localIdentifier: nil,
+            remote: .init(fingerprint: Data([2]), photoRelativePath: "2024/02/remote.jpg",
+                videoRelativePath: nil, photoContentHash: nil, videoContentHash: nil,
+                storageMonth: february, isIncomplete: false))
+        let snapshot = MediaBrowserSnapshot(sections: [
+            .init(month: february, items: [first, februaryRemote]),
+            .init(month: month, items: [januaryRemote, last]),
+        ])
+
+        XCTAssertEqual(snapshot.items(inDisplayOrderFor: Set(snapshot.itemIDs)),
+            [first, februaryRemote, januaryRemote, last])
+    }
+
+    func testSparseSelectionKeepsDisplayOrderAndDropsStaleIDs() {
+        let items = (0..<12).map { localItem("item-\($0)", isBackedUp: false) }
+        let snapshot = MediaBrowserSnapshot(sections: [
+            .init(month: .init(year: 2024, month: 3), items: Array(items.prefix(6))),
+            .init(month: .init(year: 2024, month: 2), items: []),
+            .init(month: month, items: Array(items.suffix(6))),
+        ])
+
+        XCTAssertEqual(snapshot.items(inDisplayOrderFor: [items[10].id, .local("removed"), items[2].id]),
+            [items[2], items[10]])
+    }
+
+    func testDenseSelectionAfterReloadKeepsOnlySelectedVisibleItems() {
+        let removed = localItem("removed", isBackedUp: false)
+        let changed = localItem("changed", isBackedUp: false)
+        let retained = localItem("retained", isBackedUp: false)
+        let previous = MediaBrowserSnapshot(sections: [
+            .init(month: month, items: [removed, changed, retained]),
+        ])
+        let updated = localItem("changed", isBackedUp: true)
+        let inserted = localItem("inserted", isBackedUp: false)
+        let current = MediaBrowserSnapshot(sections: [
+            .init(month: month, items: [retained, updated, inserted]),
+        ])
+        let selectedIDs = Set(previous.itemIDs)
+
+        XCTAssertEqual(current.items(inDisplayOrderFor: selectedIDs), [retained, updated])
+        let filtered = MediaBrowserSnapshot(sections: [
+            .init(month: month, items: [retained, updated, inserted]),
+        ], filter: .localOnly)
+        XCTAssertEqual(filtered.items(inDisplayOrderFor: selectedIDs), [retained])
+        XCTAssertTrue(current.items(inDisplayOrderFor: []).isEmpty)
+        XCTAssertTrue(MediaBrowserSnapshot.empty.items(inDisplayOrderFor: selectedIDs).isEmpty)
+    }
+
     private func localItem(
         _ identifier: String,
         fingerprint: Data? = Data([1]),

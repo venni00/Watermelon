@@ -44,6 +44,30 @@ final class BatchActionResolverTests: XCTestCase {
         XCTAssertFalse(r.showsDelete)
     }
 
+    func testLazySelectionIsResolvedOnceAndIgnoresRemovedItems() {
+        let local = localOnly("local")
+        let backedUp = MediaBrowserItem(kind: .photo, creationDateMs: 0,
+            localIdentifier: "backed-up", fingerprint: Data([1]), isBackedUp: true)
+        let remote = remoteOnly("remote")
+        let snapshot = MediaBrowserSnapshot(sections: [
+            .init(month: month, items: [local, backedUp, remote]),
+        ])
+        let selectedIDs: Set<MediaBrowserItemID> = [local.id, backedUp.id, remote.id, .local("removed")]
+        var lookups = 0
+        let items = selectedIDs.lazy.compactMap { id -> MediaBrowserItem? in
+            lookups += 1
+            return snapshot.item(id: id)
+        }
+
+        let result = BatchActionResolver.resolve(items)
+
+        XCTAssertEqual(lookups, selectedIDs.count)
+        XCTAssertEqual(result, .init(showsUpload: false, showsDownload: false, deviceCount: 2, remoteCount: 1))
+        XCTAssertFalse(BatchActionResolver.resolve([MediaBrowserItemID.local("removed")].lazy.compactMap {
+            snapshot.item(id: $0)
+        }).showsDelete)
+    }
+
     func testAllLocalOnlyOffersUploadAndDeviceDelete() {
         let r = BatchActionResolver.resolve([localOnly("a"), localOnly("b")])
         XCTAssertTrue(r.showsUpload)

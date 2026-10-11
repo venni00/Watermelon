@@ -115,7 +115,7 @@ final class MediaBrowserGridViewController: UIViewController {
     }
 
     private struct TransferPhotoSummaryRequestKey: Hashable {
-        let localIdentifiers: [String]
+        let localIdentifiers: Set<String>
         let options: InboxTransferOptions
     }
 
@@ -162,6 +162,7 @@ final class MediaBrowserGridViewController: UIViewController {
     private var dataSource: DataSource?
     private var loadTask: Task<Void, Never>?
     private var loadGeneration = 0
+    private var isScopeReloading = false
     private var thumbnailReloadTracker = MediaBrowserThumbnailReloadTracker()
     private weak var segmentedControl: UISegmentedControl?
     private lazy var filterBarButtonItem: UIBarButtonItem = {
@@ -200,12 +201,11 @@ final class MediaBrowserGridViewController: UIViewController {
         items: [filterBarButtonItem]
     )
 
-    private var isSelecting = false
-    private var selectedItemIDs: Set<MediaBrowserItemID> = []
+    private var selection: MediaBrowserSelection { browserSession.selection }
+    private var isSelecting: Bool { selection.isSelecting }
+    private var selectedItemIDs: Set<MediaBrowserItemID> { selection.selectedIDs }
+    private var renderedBatchActions: [BatchAction] = []
     private var isNativeMultipleSelectionInteraction = false
-    private var selectionDragSelects: Bool?
-    private var selectionDragAnchorIndex: Int?
-    private var selectionDragBaselineIDs: Set<MediaBrowserItemID> = []
     private weak var activeSelectionDragGesture: UILongPressGestureRecognizer?
     private var selectionDragDisplayLink: CADisplayLink?
     private var selectionDragDisplayLinkTimestamp: CFTimeInterval?
@@ -265,6 +265,8 @@ final class MediaBrowserGridViewController: UIViewController {
         isAnyActionRunning || activeSelectionDragGesture != nil || isNativeMultipleSelectionInteraction
     }
 
+    private var canInteractWithSelection: Bool { !defersSnapshotReload && !isScopeReloading }
+
     private var isContentActive: Bool {
         !isMediaDrop || isMediaDropActive
     }
@@ -273,7 +275,7 @@ final class MediaBrowserGridViewController: UIViewController {
         batchBarContainer.topAnchor
     }
 
-    private lazy var collectionView = UICollectionView(frame: .zero, collectionViewLayout: makeLayout())
+    private lazy var collectionView = MediaBrowserCollectionView(frame: .zero, collectionViewLayout: makeLayout())
 
     // Empty-state copy depends on the mode: "nothing backed up" only makes sense for remote.
     private func makeEmptyState() -> UIView {
@@ -439,6 +441,7 @@ final class MediaBrowserGridViewController: UIViewController {
         configureDataSource()
         actionRunner.onActionStateChanged = { [weak self] isRunning in
             self?.updateSelectBarButton()
+            self?.batchBar.isUserInteractionEnabled = !isRunning
             guard !isRunning else { return }
             self?.flushDeferredReloadIfNeeded()
         }
@@ -490,6 +493,7 @@ final class MediaBrowserGridViewController: UIViewController {
         transferPhotoSummaryTask?.cancel()
         transferPhotoSummaryTask = nil
         transferPhotoSummaryRequestKey = nil
+        setNativeSelectionInteractionActive(false)
         endSelectionDrag()
         for case let cell as MediaBrowserGridCell in collectionView.visibleCells {
             cell.cancelLoading()
@@ -634,7 +638,9 @@ final class MediaBrowserGridViewController: UIViewController {
 
     override func viewDidDisappear(_ animated: Bool) {
         super.viewDidDisappear(animated)
+        setNativeSelectionInteractionActive(false)
         endSelectionDrag()
+        refreshVisibleSelectionOverlays()
         // Only when the browsing session actually ends — not when we merely present the full-screen viewer.
         guard isBeingDismissed || isMovingFromParent || navigationController?.isBeingDismissed == true else { return }
         if selectionAction != nil {
@@ -692,7 +698,7 @@ final class MediaBrowserGridViewController: UIViewController {
     @objc private func modeChanged(_ control: UISegmentedControl) {
         guard specs.indices.contains(control.selectedSegmentIndex) else { return }
         // Don't switch source out from under a running batch (its HUD/progress would float over the new mode).
-        guard !isAnyActionRunning else {
+        guard !defersSnapshotReload else {
             control.selectedSegmentIndex = specs.firstIndex(where: { $0.mode == currentMode }) ?? 0
             return
         }
@@ -705,6 +711,7 @@ final class MediaBrowserGridViewController: UIViewController {
     }
 
     private func switchTo(spec: ModeSpec, trigger: String) {
+        isScopeReloading = true
         exitSelection()
         currentMode = spec.mode
         segmentedControl?.selectedSegmentIndex = specs.firstIndex(where: { $0.mode == spec.mode }) ?? 0
@@ -740,6 +747,7 @@ final class MediaBrowserGridViewController: UIViewController {
         // scroll past are recycled and cancel their in-flight request (renderLocalThumbnail is cancellable).
         collectionView.isPrefetchingEnabled = false
         collectionView.delegate = self
+        collectionView.onLayout = { [weak self] in self?.refreshVisibleSelectionOverlays() }
         view.addSubview(collectionView)
         collectionView.translatesAutoresizingMaskIntoConstraints = false
         let topAnchor = selectionAction == nil ? view.topAnchor : transferTopBar.bottomAnchor
@@ -782,8 +790,7 @@ final class MediaBrowserGridViewController: UIViewController {
         }
         let dataSource = DataSource(collectionView: collectionView) { [weak self] collectionView, indexPath, itemID in
             guard let self,
-                  let item = self.item(at: indexPath),
-                  item.id == itemID else {
+                  let item = self.browserSnapshot.item(id: itemID) else {
                 return collectionView.dequeueReusableCell(
                     withReuseIdentifier: Self.fallbackCellReuseID,
                     for: indexPath
@@ -892,6 +899,7 @@ final class MediaBrowserGridViewController: UIViewController {
                     }
                     let changedItemIDs = snapshot.changedItemIDs(comparedTo: self.browserSnapshot)
                     self.browserSession.replace(with: snapshot)
+                    self.isScopeReloading = false
                     self.applySnapshot(
                         reconfiguring: changedItemIDs,
                         thumbnailReloadGeneration: thumbnailReloadGeneration,
@@ -910,7 +918,6 @@ final class MediaBrowserGridViewController: UIViewController {
                         if self.months.isEmpty, self.selectionAction == nil {
                             self.exitSelection()
                         } else {
-                            self.selectedItemIDs.formIntersection(Set(snapshot.itemIDs))
                             self.recomputeBatchBar()
                             self.refreshVisibleSelectionOverlays()
                         }
@@ -974,8 +981,9 @@ final class MediaBrowserGridViewController: UIViewController {
                     startedAt: applyStartedAt,
                     details: "items=\(itemCount)"
                 )
-                guard let self,
-                      let thumbnailReloadGeneration,
+                guard let self, loadGeneration == nil || self.loadGeneration == loadGeneration else { return }
+                self.refreshVisibleSelectionOverlays()
+                guard let thumbnailReloadGeneration,
                       let loadGeneration,
                       self.loadGeneration == loadGeneration,
                       self.thumbnailReloadTracker.shouldApply(thumbnailReloadGeneration) else { return }
@@ -986,7 +994,8 @@ final class MediaBrowserGridViewController: UIViewController {
     }
 
     private func item(at indexPath: IndexPath) -> MediaBrowserItem? {
-        browserSnapshot.item(section: indexPath.section, item: indexPath.item)
+        guard let id = dataSource?.itemIdentifier(for: indexPath) else { return nil }
+        return browserSnapshot.item(id: id)
     }
 
     // MARK: - Multi-select
@@ -1119,7 +1128,7 @@ final class MediaBrowserGridViewController: UIViewController {
         transferLocalLibraryButton.showsMenuAsPrimaryAction = true
         transferLocalLibrary?.canChangeScope = { [weak self] in
             guard let self else { return false }
-            return self.isContentActive && !self.isAnyActionRunning && !self.transferFileSelection.isWorking
+            return self.isContentActive && !self.defersSnapshotReload && !self.transferFileSelection.isWorking
         }
         transferLocalLibrary?.onScopeChanged = { [weak self] in
             guard let self, let spec = self.specs.first(where: { $0.mode == .local }) else { return }
@@ -1259,7 +1268,7 @@ final class MediaBrowserGridViewController: UIViewController {
     }
 
     private func requestTransferPhotoSelectionDetails(for items: [MediaBrowserItem]) {
-        let localIdentifiers = items.compactMap(\.localIdentifier).sorted()
+        let localIdentifiers = Set(items.compactMap(\.localIdentifier))
         let key = TransferPhotoSummaryRequestKey(
             localIdentifiers: localIdentifiers,
             options: inboxTransferOptions
@@ -1284,7 +1293,7 @@ final class MediaBrowserGridViewController: UIViewController {
         transferPhotoSummaryTask = Task { @MainActor [weak self] in
             let details = await withCancellableDetachedValue(priority: .userInitiated) {
                 InboxTransferService.photoSelectionDetails(
-                    localIdentifiers: Set(localIdentifiers),
+                    localIdentifiers: localIdentifiers,
                     options: key.options
                 )
             }
@@ -1355,7 +1364,8 @@ final class MediaBrowserGridViewController: UIViewController {
                 thumbnailProvider: nil,
                 onOpen: nil
             ) { [weak self] in
-                self?.transferFileSelection.remove(file)
+                guard let self, !self.isAnyActionRunning else { return }
+                self.transferFileSelection.remove(file)
             }
         }
     }
@@ -1382,7 +1392,8 @@ final class MediaBrowserGridViewController: UIViewController {
             items: transferFileSelectionPopoverItems(files: files),
             sourceView: sender
         ) { [weak self] in
-            self?.transferFileSelection.removeAll()
+            guard let self, !self.isAnyActionRunning else { return }
+            self.transferFileSelection.removeAll()
         }
     }
 
@@ -1401,10 +1412,8 @@ final class MediaBrowserGridViewController: UIViewController {
             items: transferMediaSelectionPopoverItems(for: group, items: items),
             sourceView: sourceView
         ) { [weak self] in
-            guard let self else { return }
-            self.applySelectedItemIDs(
-                self.selectedItemIDs.subtracting(Set(items.map(\.id)))
-            )
+            guard let self, !self.defersSnapshotReload else { return }
+            if self.selection.remove(items.lazy.map(\.id)) { self.selectionDidChange() }
         }
     }
 
@@ -1414,7 +1423,7 @@ final class MediaBrowserGridViewController: UIViewController {
         sourceView: UIView,
         onDeselectAll: @escaping @MainActor () -> Void
     ) {
-        guard !items.isEmpty, presentedViewController == nil else { return }
+        guard !defersSnapshotReload, !items.isEmpty, presentedViewController == nil else { return }
         let controller = MediaDropSelectionPopoverViewController(
             title: title,
             items: items,
@@ -1499,7 +1508,7 @@ final class MediaBrowserGridViewController: UIViewController {
             image: UIImage(systemName: "arrow.counterclockwise"),
             attributes: inboxTransferOptions == defaults ? .disabled : []
         ) { [weak self] _ in
-            guard let self else { return }
+            guard let self, !self.defersSnapshotReload else { return }
             self.inboxTransferOptions = InboxTransferOptions.storedValue
             self.updateTransferOptionsButton()
             self.recomputeBatchBar()
@@ -1559,7 +1568,7 @@ final class MediaBrowserGridViewController: UIViewController {
     }
 
     private func setTransferOption(_ option: InboxTransferOptions.Option, isEnabled: Bool) {
-        guard inboxTransferOptions.contains(option) != isEnabled else { return }
+        guard !defersSnapshotReload, inboxTransferOptions.contains(option) != isEnabled else { return }
         inboxTransferOptions = inboxTransferOptions.updating(option, isEnabled: isEnabled)
         updateTransferOptionsButton()
         recomputeBatchBar()
@@ -2118,7 +2127,7 @@ final class MediaBrowserGridViewController: UIViewController {
         if case .terminal(_, let kind) = selectionActionUIState {
             selectionActionUIState = .idle
             if kind == .completed {
-                selectedItemIDs.removeAll()
+                selection.clear()
                 completedTransferSelectionCounts = nil
                 refreshVisibleSelectionOverlays()
             }
@@ -2163,9 +2172,9 @@ final class MediaBrowserGridViewController: UIViewController {
         selectionBarButtonItem.accessibilityLabel = isSelecting
             ? String(localized: "common.cancel")
             : String(localized: "mediaBrowser.select")
-        selectionBarButtonItem.action = isSelecting ? #selector(exitSelection) : #selector(enterSelection)
-        selectionBarButtonItem.isEnabled = isSelecting || !months.isEmpty
-        selectAllBarButtonItem.isEnabled = isSelecting && !browserSnapshot.isEmpty && !isAnyActionRunning
+        selectionBarButtonItem.action = isSelecting ? #selector(cancelSelection) : #selector(enterSelection)
+        selectionBarButtonItem.isEnabled = !isAnyActionRunning && !isScopeReloading && (isSelecting || !months.isEmpty)
+        selectAllBarButtonItem.isEnabled = isSelecting && !browserSnapshot.isEmpty && canInteractWithSelection
 
         let updateAppearance = {
             self.selectionBarButtonItem.title = self.isSelecting ? nil : String(localized: "mediaBrowser.select")
@@ -2190,8 +2199,9 @@ final class MediaBrowserGridViewController: UIViewController {
         }
     }
 
-    private func setFilter(_ filter: MediaBrowserFilter) {
+    func setFilter(_ filter: MediaBrowserFilter) {
         guard currentMode.availableFilters.contains(filter), filter != currentFilter, !defersSnapshotReload else { return }
+        isScopeReloading = true
         exitSelection()
         currentFilter = filter
         pendingScrollMonth = nil
@@ -2200,9 +2210,8 @@ final class MediaBrowserGridViewController: UIViewController {
     }
 
     @objc private func enterSelection() {
-        guard !isSelecting, !months.isEmpty || selectionAction != nil else { return }
-        isSelecting = true
-        selectedItemIDs.removeAll()
+        guard !isAnyActionRunning, !isScopeReloading, !months.isEmpty || selectionAction != nil,
+              selection.enter() else { return }
         setBatchBarVisible(selectionAction == nil, animated: false)
         updateSelectBarButton(animated: true)
         recomputeBatchBar()
@@ -2210,19 +2219,20 @@ final class MediaBrowserGridViewController: UIViewController {
     }
 
     @objc private func selectAllItems() {
-        guard selectionAction == nil, isSelecting, !defersSnapshotReload else { return }
-        applySelectedItemIDs(Set(browserSnapshot.itemIDs))
+        guard selectionAction == nil, isSelecting, canInteractWithSelection else { return }
+        if selection.selectAll() { selectionDidChange() }
+    }
+
+    @objc private func cancelSelection() {
+        guard !isAnyActionRunning else { return }
+        exitSelection()
     }
 
     @objc private func exitSelection() {
         guard isSelecting else { return }
-        isSelecting = false
-        isNativeMultipleSelectionInteraction = false
+        selection.exit()
+        setNativeSelectionInteractionActive(false)
         endSelectionDrag()
-        selectedItemIDs.removeAll()
-        collectionView.indexPathsForSelectedItems?.forEach {
-            collectionView.deselectItem(at: $0, animated: false)
-        }
         setBatchBarVisible(false, animated: false)
         updateSelectBarButton(animated: true)
         refreshVisibleSelectionOverlays()
@@ -2233,29 +2243,24 @@ final class MediaBrowserGridViewController: UIViewController {
         synchronizeCollectionSelection()
         for indexPath in collectionView.indexPathsForVisibleItems {
             guard let cell = collectionView.cellForItem(at: indexPath) as? MediaBrowserGridCell,
-                  let item = item(at: indexPath) else { continue }
-            cell.setSelecting(isSelecting, selected: selectedItemIDs.contains(item.id))
+                  let itemID = dataSource?.itemIdentifier(for: indexPath) else { continue }
+            cell.setSelecting(isSelecting, selected: selectedItemIDs.contains(itemID))
         }
     }
 
-    private func synchronizeCollectionSelection() {
-        for indexPath in collectionView.indexPathsForSelectedItems ?? [] {
-            guard isSelecting,
-                  let item = item(at: indexPath),
-                  selectedItemIDs.contains(item.id) else {
-                collectionView.deselectItem(at: indexPath, animated: false)
-                continue
-            }
-        }
-        guard isSelecting else { return }
-        for itemID in selectedItemIDs {
-            guard let indexPath = dataSource?.indexPath(for: itemID) else { continue }
-            collectionView.selectItem(at: indexPath, animated: false, scrollPosition: [])
-        }
+    private func synchronizeCollectionSelection(including indexPath: IndexPath? = nil) {
+        var visible = Set(collectionView.indexPathsForVisibleItems)
+        if let indexPath { visible.insert(indexPath) }
+        MediaBrowserCollectionSelection.synchronize(
+            in: collectionView, visibleIndexPaths: visible,
+            isSelecting: isSelecting, selectedItemIDs: selectedItemIDs,
+            preservesOffscreenSelection: isNativeMultipleSelectionInteraction,
+            itemID: { self.dataSource?.itemIdentifier(for: $0) }
+        )
     }
 
     private func toggleSelectionFromButton(for itemID: MediaBrowserItemID) {
-        guard !isAnyActionRunning else { return }
+        guard canInteractWithSelection else { return }
         if !isSelecting { enterSelection() }
         guard isSelecting else { return }
         setSelected(!selectedItemIDs.contains(itemID), for: itemID)
@@ -2267,13 +2272,11 @@ final class MediaBrowserGridViewController: UIViewController {
     ) {
         switch gesture.state {
         case .began:
-            guard !isAnyActionRunning else { return }
+            guard canInteractWithSelection else { return }
             if !isSelecting { enterSelection() }
-            guard isSelecting, let anchorIndex = browserSnapshot.index(of: itemID) else { return }
-            selectionDragSelects = !selectedItemIDs.contains(itemID)
-            selectionDragAnchorIndex = anchorIndex
-            selectionDragBaselineIDs = selectedItemIDs
+            guard selection.beginDrag(at: itemID) else { return }
             activeSelectionDragGesture = gesture
+            selectionInteractionDidChange()
             beginSelectionDragAutoscroll()
             updateSelectionDrag(through: itemID)
         case .changed:
@@ -2294,14 +2297,25 @@ final class MediaBrowserGridViewController: UIViewController {
     }
 
     private func endSelectionDrag() {
+        let wasDragging = activeSelectionDragGesture != nil || selection.isDragging
         selectionDragDisplayLink?.invalidate()
         selectionDragDisplayLink = nil
         selectionDragDisplayLinkTimestamp = nil
         activeSelectionDragGesture = nil
-        selectionDragSelects = nil
-        selectionDragAnchorIndex = nil
-        selectionDragBaselineIDs.removeAll()
+        selection.endDrag()
+        if wasDragging { selectionInteractionDidChange() }
         flushDeferredReloadIfNeeded()
+    }
+
+    private func setNativeSelectionInteractionActive(_ active: Bool) {
+        guard isNativeMultipleSelectionInteraction != active else { return }
+        isNativeMultipleSelectionInteraction = active
+        selectionInteractionDidChange()
+    }
+
+    private func selectionInteractionDidChange() {
+        updateSelectBarButton()
+        if isMediaDrop, isContentActive { recomputeBatchBar() }
     }
 
     @objc
@@ -2347,7 +2361,7 @@ final class MediaBrowserGridViewController: UIViewController {
     }
 
     private func updateSelectionDrag(at point: CGPoint) {
-        guard selectionDragSelects != nil else { return }
+        guard selection.isDragging else { return }
         if let indexPath = collectionView.indexPathForItem(at: point),
            let item = item(at: indexPath) {
             updateSelectionDrag(through: item.id)
@@ -2369,59 +2383,24 @@ final class MediaBrowserGridViewController: UIViewController {
     }
 
     private func updateSelectionDrag(through itemID: MediaBrowserItemID) {
-        guard let selects = selectionDragSelects,
-              let anchorIndex = selectionDragAnchorIndex,
-              let currentIndex = browserSnapshot.index(of: itemID) else { return }
-        let bounds = min(anchorIndex, currentIndex) ... max(anchorIndex, currentIndex)
-        let rangeIDs = Set(bounds.compactMap { browserSnapshot.item(at: $0)?.id })
-        var updatedIDs = selectionDragBaselineIDs
-        if selects {
-            updatedIDs.formUnion(rangeIDs)
-        } else {
-            updatedIDs.subtract(rangeIDs)
-        }
-        applySelectedItemIDs(updatedIDs)
+        guard !isAnyActionRunning else { endSelectionDrag(); return }
+        if selection.updateDrag(through: itemID) { selectionDidChange() }
     }
 
-    private func applySelectedItemIDs(_ itemIDs: Set<MediaBrowserItemID>) {
-        let changedIDs = selectedItemIDs.symmetricDifference(itemIDs)
-        guard !changedIDs.isEmpty else { return }
-        selectedItemIDs = itemIDs
-        for itemID in changedIDs {
-            guard let indexPath = dataSource?.indexPath(for: itemID) else { continue }
-            let selected = itemIDs.contains(itemID)
-            if selected {
-                collectionView.selectItem(at: indexPath, animated: false, scrollPosition: [])
-            } else {
-                collectionView.deselectItem(at: indexPath, animated: false)
-            }
-            (collectionView.cellForItem(at: indexPath) as? MediaBrowserGridCell)?
-                .setSelecting(true, selected: selected)
-        }
+    private func selectionDidChange() {
+        refreshVisibleSelectionOverlays()
         recomputeBatchBar()
     }
 
     private func setSelected(_ selected: Bool, for itemID: MediaBrowserItemID) {
-        guard isSelecting, selectedItemIDs.contains(itemID) != selected else { return }
-        var updatedIDs = selectedItemIDs
-        if selected {
-            updatedIDs.insert(itemID)
-        } else {
-            updatedIDs.remove(itemID)
-        }
-        applySelectedItemIDs(updatedIDs)
+        guard !isAnyActionRunning, !isScopeReloading else { return }
+        if selection.setSelected(selected, for: itemID) { selectionDidChange() }
     }
 
-    private func selectedMediaItems() -> [MediaBrowserItem] {
-        guard !selectedItemIDs.isEmpty else { return [] }
-        return selectedItemIDs
-            .compactMap { itemID -> (Int, MediaBrowserItem)? in
-                guard let index = browserSnapshot.index(of: itemID),
-                      let item = browserSnapshot.item(at: index) else { return nil }
-                return (index, item)
-            }
-            .sorted { $0.0 < $1.0 }
-            .map(\.1)
+    private func selectedMediaItems() -> [MediaBrowserItem] { selection.orderedItems }
+
+    private var selectedTransferItemCount: Int {
+        selection.summary.deviceCount + transferFileSelection.files.count
     }
 
     private func selectedTransferItems() -> [InboxTransferItem] {
@@ -2433,11 +2412,11 @@ final class MediaBrowserGridViewController: UIViewController {
     }
 
     private func recomputeBatchBar() {
-        let selectedItems = selectedMediaItems()
         if let selectionAction {
-            let transferItems = selectedTransferItems()
+            let selectedItems = selectedMediaItems()
+            let transferItemCount = selectedTransferItemCount
             let accessPolicy = selectionAction.accessPolicy()
-            let exceedsTransferLimit = !accessPolicy.allows(itemCount: transferItems.count)
+            let exceedsTransferLimit = !accessPolicy.allows(itemCount: transferItemCount)
             if exceedsTransferLimit, !wasTransferLimitExceeded {
                 HUD.flash(
                     String(localized: "transfer.limit.selectionToast"),
@@ -2450,13 +2429,14 @@ final class MediaBrowserGridViewController: UIViewController {
                 mediaItems: selectedItems,
                 files: transferFileSelection.files
             )
-            let canChooseDestination = !transferItems.isEmpty
+            let canChooseDestination = transferItemCount > 0
+                && canInteractWithSelection
                 && !exceedsTransferLimit
                 && selectionAction.canChooseDestination()
                 && !selectionActionUIState.isPerforming
                 && !transferFileSelection.isWorking
             let showsActivityPanel = selectionActionUIState.showsPanel || transferFileSelection.isWorking
-            setBatchBarVisible(!transferItems.isEmpty || showsActivityPanel, animated: true)
+            setBatchBarVisible(transferItemCount > 0 || showsActivityPanel, animated: true)
             selectionActionButton.isEnabled = true
             selectionActionButton.isUserInteractionEnabled = canChooseDestination
             updateSelectionActionButtonAppearance(isAvailable: canChooseDestination)
@@ -2488,7 +2468,7 @@ final class MediaBrowserGridViewController: UIViewController {
             return
         }
 
-        let result = BatchActionResolver.resolve(selectedItems)
+        let result = selection.summary.actions
         // Upload/download need a live remote session AND an authoritative presence for the active profile: hide
         // them offline (no destination → "not connected"), and during a profile switch's reload window, when
         // items transiently read `.localOnly`, so the bar can't advertise a remote action for content whose
@@ -2504,11 +2484,14 @@ final class MediaBrowserGridViewController: UIViewController {
         if result.showsDelete {
             entries.append(MediaActionBar.Entry(id: BatchAction.delete, symbolName: "trash", title: String(localized: "mediaBrowser.action.delete"), isDestructive: true))
         }
+        let actions = entries.compactMap { $0.id.base as? BatchAction }
+        guard actions != renderedBatchActions else { return }
+        renderedBatchActions = actions
         batchBar.configure(entries: entries) { [weak self] id in self?.handleBatchTap(id) }
     }
 
     private func handleBatchTap(_ id: AnyHashable) {
-        guard let action = id as? BatchAction else { return }
+        guard canInteractWithSelection, isSelecting, let action = id as? BatchAction else { return }
         let items = selectedMediaItems()
         guard !items.isEmpty else { return }
         actionRunner.runBatch(action, items: items, from: self) { [weak self] in
@@ -2519,7 +2502,8 @@ final class MediaBrowserGridViewController: UIViewController {
     }
 
     private func handleSelectionAction(_ destination: InboxTransferDestination) {
-        guard let selectionAction else { return }
+        guard canInteractWithSelection, !transferFileSelection.isWorking,
+              let selectionAction else { return }
         let items = selectedTransferItems()
         guard !items.isEmpty,
               selectionAction.accessPolicy().allows(itemCount: items.count) else { return }
@@ -2551,9 +2535,9 @@ final class MediaBrowserGridViewController: UIViewController {
     func runExternalSelectionAction(
         _ operation: @escaping @MainActor (InboxTransferActivity) async -> Bool
     ) -> Bool {
-        guard !isAnyActionRunning else { return false }
+        guard canInteractWithSelection, !transferFileSelection.isWorking else { return false }
         if let selectionAction,
-           !selectionAction.accessPolicy().allows(itemCount: selectedTransferItems().count) {
+           !selectionAction.accessPolicy().allows(itemCount: selectedTransferItemCount) {
             return false
         }
         let preparingStatus = String(localized: "transfer.progress.preparing")
@@ -2594,10 +2578,9 @@ final class MediaBrowserGridViewController: UIViewController {
             self.selectionActionTask = nil
             self.selectionActionActivity = nil
             if completed {
-                let selectedMedia = self.selectedMediaItems()
                 self.completedTransferSelectionCounts = TransferSelectionCounts(
-                    photos: selectedMedia.lazy.filter { !$0.isVideo }.count,
-                    videos: selectedMedia.lazy.filter(\.isVideo).count,
+                    photos: self.selection.summary.photoCount,
+                    videos: self.selection.summary.videoCount,
                     files: self.transferFileSelection.files.count
                 )
                 self.selectionActionUIState = .terminal(status: lastStatus, kind: .completed)
@@ -2667,7 +2650,7 @@ extension MediaBrowserGridViewController: UICollectionViewDelegate {
             setSelected(true, for: item.id)
             return
         }
-        collectionView.deselectItem(at: indexPath, animated: true)
+        synchronizeCollectionSelection(including: indexPath)
         presentViewer(at: indexPath)
     }
 
@@ -2677,9 +2660,7 @@ extension MediaBrowserGridViewController: UICollectionViewDelegate {
             setSelected(false, for: item.id)
             return
         }
-        if isSelecting, selectedItemIDs.contains(item.id) {
-            collectionView.selectItem(at: indexPath, animated: false, scrollPosition: [])
-        }
+        synchronizeCollectionSelection(including: indexPath)
         presentViewer(at: indexPath)
     }
 
@@ -2709,25 +2690,28 @@ extension MediaBrowserGridViewController: UICollectionViewDelegate {
         _ collectionView: UICollectionView,
         shouldBeginMultipleSelectionInteractionAt indexPath: IndexPath
     ) -> Bool {
-        !isAnyActionRunning && !months.isEmpty
+        canInteractWithSelection && !months.isEmpty
     }
 
     func collectionView(
         _ collectionView: UICollectionView,
         didBeginMultipleSelectionInteractionAt indexPath: IndexPath
     ) {
-        isNativeMultipleSelectionInteraction = true
+        guard canInteractWithSelection, item(at: indexPath) != nil else { return }
         if !isSelecting { enterSelection() }
+        setNativeSelectionInteractionActive(isSelecting)
     }
 
     func collectionViewDidEndMultipleSelectionInteraction(_ collectionView: UICollectionView) {
-        isNativeMultipleSelectionInteraction = false
+        setNativeSelectionInteractionActive(false)
+        refreshVisibleSelectionOverlays()
         flushDeferredReloadIfNeeded()
     }
 
     // Load a thumbnail only once its cell actually enters the visible rect…
     func collectionView(_ collectionView: UICollectionView, willDisplay cell: UICollectionViewCell, forItemAt indexPath: IndexPath) {
         guard let cell = cell as? MediaBrowserGridCell, let item = item(at: indexPath) else { return }
+        cell.setSelecting(isSelecting, selected: selectedItemIDs.contains(item.id))
         cell.beginLoading(item: item, source: source)
     }
 
