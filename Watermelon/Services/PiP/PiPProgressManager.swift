@@ -15,8 +15,8 @@ final class PiPProgressManager: NSObject {
     private var displayLayer: AVSampleBufferDisplayLayer?
     private var pipSourceView: UIView?
     private var refreshTimer: Timer?
-    private var ambientPlayer: AVAudioPlayer?
-    private var chimePlayer: AVAudioPlayer?
+    private let audioController = PiPProgressAudioController()
+    private var audioPreparationID: UUID?
 
     private(set) var isActive = false
     private var hasActiveTask = false
@@ -162,10 +162,6 @@ final class PiPProgressManager: NSObject {
     }
 
     @objc private func settingsDidUpdate() {
-        if let player = ambientPlayer {
-            player.volume = ambientVolume
-            return
-        }
         if isPiPShowing, !isFinished {
             startAmbientLoop()
         }
@@ -174,7 +170,9 @@ final class PiPProgressManager: NSObject {
     private func finishPiP(statusText: String, tone: FinishTone) {
         hasActiveTask = false
         needsUserDecision = false
-        guard isActive, !isFinished else { return }
+        let wasPreparingAudio = audioPreparationID != nil
+        audioPreparationID = nil
+        guard isActive || wasPreparingAudio, !isFinished else { return }
 
         if isPiPShowing {
             isFinished = true
@@ -198,9 +196,23 @@ final class PiPProgressManager: NSObject {
     // MARK: - PiP Infrastructure
 
     private func preparePiPController() {
-        guard pipController == nil else { return }
+        guard pipController == nil, audioPreparationID == nil else { return }
 
-        configureAudioSession()
+        let preparationID = UUID()
+        audioPreparationID = preparationID
+        audioController.prepareSession { [weak self] succeeded in
+            guard let self, self.audioPreparationID == preparationID else { return }
+            self.audioPreparationID = nil
+            guard succeeded, self.hasActiveTask else { return }
+            self.installPiPController()
+            if UIApplication.shared.applicationState != .active {
+                self.appWillResignActive()
+            }
+        }
+    }
+
+    private func installPiPController() {
+        guard pipController == nil else { return }
 
         let layer = AVSampleBufferDisplayLayer()
         layer.frame = CGRect(origin: .zero, size: Self.pipSize)
@@ -238,6 +250,7 @@ final class PiPProgressManager: NSObject {
     }
 
     private func tearDown() {
+        audioPreparationID = nil
         stopRefreshTimer()
         stopAmbientLoop()
 
@@ -272,24 +285,12 @@ final class PiPProgressManager: NSObject {
 
     // MARK: - Audio
 
-    private func configureAudioSession() {
-        let session = AVAudioSession.sharedInstance()
-        try? session.setCategory(.playback, mode: .moviePlayback, options: [.mixWithOthers])
-        try? session.setActive(true)
-    }
-
     private func startAmbientLoop() {
-        guard ambientPlayer == nil, !isFinished,
+        guard !isFinished,
               let url = Bundle.main.url(forResource: "keyboard-typing", withExtension: "mp3") else {
             return
         }
-        do {
-            let player = try AVAudioPlayer(contentsOf: url)
-            player.numberOfLoops = -1
-            player.volume = ambientVolume
-            player.play()
-            ambientPlayer = player
-        } catch {}
+        audioController.startAmbientLoop(url: url, volume: ambientVolume)
     }
 
     // Keep playback active for PiP/background continuity when sound is off.
@@ -298,18 +299,12 @@ final class PiPProgressManager: NSObject {
     }
 
     private func stopAmbientLoop() {
-        ambientPlayer?.stop()
-        ambientPlayer = nil
+        audioController.stopAmbientLoop()
     }
 
     private func playCompletionChime() {
         guard let url = Bundle.main.url(forResource: "complete", withExtension: "wav") else { return }
-        do {
-            let player = try AVAudioPlayer(contentsOf: url)
-            player.volume = 0.4
-            player.play()
-            chimePlayer = player
-        } catch {}
+        audioController.playCompletionChime(url: url)
     }
 
     // MARK: - Timer
