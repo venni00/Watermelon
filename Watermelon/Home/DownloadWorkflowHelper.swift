@@ -24,6 +24,7 @@ final class DownloadWorkflowHelper {
     struct Context: Sendable {
         let profile: ServerProfileRecord
         let password: String
+        let downloadPolicy = RestoreDownloadPolicy()
     }
 
     private let restoreService: any RestoreItemsServing
@@ -82,7 +83,7 @@ final class DownloadWorkflowHelper {
                 items: descriptors,
                 profile: context.profile,
                 password: context.password,
-                downloadPolicy: RestoreDownloadPolicy(),
+                downloadPolicy: context.downloadPolicy,
                 shouldDrain: shouldDrain,
                 onTransferState: { state in
                     await onTransferState(state)

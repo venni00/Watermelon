@@ -116,7 +116,7 @@ extension ExecutionLogHistoryViewController: UITableViewDataSource, UITableViewD
     func tableView(_ tableView: UITableView, trailingSwipeActionsConfigurationForRowAt indexPath: IndexPath) -> UISwipeActionsConfiguration? {
         let info = sections[indexPath.section].sessions[indexPath.row]
         let delete = UIContextualAction(style: .destructive, title: String(localized: "log.history.delete")) { [weak self] _, _, completion in
-            try? FileManager.default.removeItem(at: info.url)
+            ExecutionLogFileStore.removeSession(at: info.url)
             self?.reload()
             completion(true)
         }
@@ -201,7 +201,7 @@ final class ExecutionLogHistoryDetailViewController: UIViewController {
 
     @objc
     private func exportTapped() {
-        let activityController = UIActivityViewController(activityItems: [session.url], applicationActivities: nil)
+        let activityController = UIActivityViewController(activityItems: ExecutionLogFileStore.exportURLs(for: session.url), applicationActivities: nil)
         activityController.popoverPresentationController?.barButtonItem = navigationItem.rightBarButtonItem
         present(activityController, animated: true)
     }

@@ -100,16 +100,17 @@ final class RestoreParallelDownloadTests: XCTestCase {
         }
     }
 
-    func testDrainCompletesWholeHeadAssetAndCleansPrefetch() async throws {
+    func testDrainCompletesWholeHeadAssetAndCleansLargePrefetchQueue() async throws {
         let clients = [InMemoryRemoteStorageClient(), InMemoryRemoteStorageClient()]
         let factory = RestoreTestClientFactory(clients)
-        await seed(clients, names: ["first.jpg", "first.mov", "second.jpg"])
+        let laterNames = (1...32).map { "prefetched-\($0).jpg" }
+        await seed(clients, names: ["first.jpg", "first.mov"] + laterNames)
         let head = RestoreTestLatch()
-        let secondDownloaded = expectation(description: "second asset downloaded")
+        let prefetched = expectation(description: "32 later assets downloaded behind blocked head")
         let drain = ExecutionTerminationControl()
         for client in clients {
             await client.setOnDownloadAttempt { path in if path.hasSuffix("first.jpg") { await head.wait() } }
-            await client.setOnDownload { path in if path.hasSuffix("second.jpg") { secondDownloaded.fulfill() } }
+            await client.setOnDownload { path in if path.hasSuffix("prefetched-32.jpg") { prefetched.fulfill() } }
         }
         let recorder = RestoreParallelRecorder()
         let service = RestoreService(makeClient: { _, _ in factory.make() }, importAsset: { downloaded, _ in
@@ -124,7 +125,7 @@ final class RestoreParallelDownloadTests: XCTestCase {
             resourceHash: Data(SHA256.hash(data: videoData)), fileName: "first.mov", fileSize: Int64(videoData.count),
             remoteRelativePath: "2026/01/first.mov", creationDateMs: 1_000)
         first = .init(instances: first.instances + [video], identity: first.identity)
-        let items = [first, item("second.jpg")]
+        let items = [first] + laterNames.map(item)
         let profile = profile()
         let task = Task {
             try await service.restoreItems(items: items, profile: profile, password: "", downloadPolicy: .init(),
@@ -133,17 +134,22 @@ final class RestoreParallelDownloadTests: XCTestCase {
                     XCTAssertEqual(restored?.asset.localIdentifier, "first")
                 })
         }
-        await fulfillment(of: [secondDownloaded], timeout: 3)
+        await fulfillment(of: [prefetched], timeout: 3)
         drain.request(.pause)
         await head.open()
         do { _ = try await task.value; XCTFail("expected drain") } catch is CancellationError {}
         let imports = await recorder.names
         XCTAssertEqual(imports, ["first"])
+        var downloadedCount = 0
         for client in clients {
-            for url in await client.downloadAttemptLocalURLs {
+            let urls = await client.downloadAttemptLocalURLs
+            downloadedCount += urls.count
+            for url in urls {
                 XCTAssertFalse(FileManager.default.fileExists(atPath: url.path))
+                XCTAssertFalse(FileManager.default.fileExists(atPath: url.deletingLastPathComponent().path))
             }
         }
+        XCTAssertEqual(downloadedCount, 34)
     }
 
     func testLegacyUnhashedResourcesAreAllIncludedInBudget() {

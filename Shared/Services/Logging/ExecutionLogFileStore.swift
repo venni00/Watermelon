@@ -19,11 +19,23 @@ enum ExecutionLogFileStore {
         rootDirectory.appendingPathComponent(kind.directoryName, isDirectory: true)
     }
 
+    static func restoreTraceURL(for logURL: URL) -> URL {
+        logURL.deletingPathExtension().appendingPathExtension("restore-trace.jsonl")
+    }
+
+    static func exportURLs(for logURL: URL) -> [URL] {
+        [logURL, restoreTraceURL(for: logURL)].filter { FileManager.default.fileExists(atPath: $0.path) }
+    }
+
+    static func removeSession(at logURL: URL) {
+        for url in exportURLs(for: logURL) { try? FileManager.default.removeItem(at: url) }
+    }
+
     static func beginSession(kind: ExecutionLogKind, startedAt: Date = Date()) -> ExecutionLogSessionWriter {
         let dir = directory(for: kind)
         try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         try? FileProtection.enableBackgroundAccess(at: dir)
-        let name = Self.fileNameFormatter.string(from: startedAt) + ".log"
+        let name = Self.fileNameFormatter.string(from: startedAt) + "-" + UUID().uuidString + ".log"
         let url = dir.appendingPathComponent(name)
         return ExecutionLogSessionWriter(fileURL: url, kind: kind, startedAt: startedAt)
     }
@@ -70,7 +82,7 @@ enum ExecutionLogFileStore {
                 let attrs = try? FileManager.default.attributesOfItem(atPath: url.path)
                 let mtime = (attrs?[.modificationDate] as? Date) ?? (attrs?[.creationDate] as? Date) ?? .distantPast
                 if mtime < cutoff {
-                    try? FileManager.default.removeItem(at: url)
+                    removeSession(at: url)
                 }
             }
         }

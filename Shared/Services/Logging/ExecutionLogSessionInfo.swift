@@ -8,11 +8,13 @@ struct ExecutionLogSessionInfo: Hashable, Sendable {
 
     static func parse(url: URL, kind: ExecutionLogKind) -> ExecutionLogSessionInfo? {
         let base = url.deletingPathExtension().lastPathComponent
-        guard let startedAt = ExecutionLogFileStore.fileNameFormatter.date(from: base) else {
+        guard let startedAt = ExecutionLogFileStore.fileNameFormatter.date(from: String(base.prefix(16))) else {
             return nil
         }
-        let attrs = try? FileManager.default.attributesOfItem(atPath: url.path)
-        let size = (attrs?[.size] as? NSNumber)?.int64Value ?? 0
+        let size = ExecutionLogFileStore.exportURLs(for: url).reduce(Int64(0)) { total, file in
+            let attrs = try? FileManager.default.attributesOfItem(atPath: file.path)
+            return total + ((attrs?[.size] as? NSNumber)?.int64Value ?? 0)
+        }
         return ExecutionLogSessionInfo(url: url, kind: kind, startedAt: startedAt, sizeBytes: size)
     }
 

@@ -190,6 +190,14 @@ final class AppCacheManagerTests: XCTestCase {
         XCTAssertFalse(fm.fileExists(atPath: original.path))
     }
 
+    func testLegacyRestoreTraceCanBeClearedWithExecutionLogs() throws {
+        let url = try write(locations.executionLogs, "manual/session.restore-trace.jsonl", bytes: 32)
+        let manager = AppCacheManager(locations: locations)
+        XCTAssertTrue(fm.fileExists(atPath: url.path))
+        XCTAssertTrue(manager.clearFiles(.executionLogs))
+        XCTAssertFalse(fm.fileExists(atPath: url.path))
+    }
+
     func testRemoteSnapshotsAreCountedAsReadOnlyOtherData() throws {
         let snapshot = try write(remoteSnapshotDirectory, "profile.json", bytes: 10)
         let unknown = try write(remoteSnapshotDirectory, "unknown.sqlite", bytes: 20)

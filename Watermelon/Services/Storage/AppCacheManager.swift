@@ -343,7 +343,7 @@ final class AppCacheManager: @unchecked Sendable {
         guard category.allowsClearing, !access.isProtected(file.url) else { return false }
         switch category {
         case .executionLogs:
-            return file.url.pathExtension == "log"
+            return file.url.pathExtension == "log" || file.url.lastPathComponent.hasSuffix(".restore-trace.jsonl")
         case .temporaryFiles:
             guard let previous = previousTemporaryFiles[file.url] else { return false }
             if previous == file { return true }

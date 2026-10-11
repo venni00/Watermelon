@@ -2,17 +2,79 @@ import XCTest
 @testable import Watermelon
 
 final class OrderedRestorePipelineTests: XCTestCase {
-    func testOutOfOrderDownloadsCommitInOrderAndBoundLookahead() async throws {
+    func testDefaultPolicyPrefetchesPastEightItemsWhileHeadDownloadIsBlocked() async throws {
         let head = RestoreTestLatch()
-        let laterReady = expectation(description: "second download ready")
+        let prefetched = expectation(description: "all later downloads prepared behind blocked head")
         let probe = RestorePipelineProbe()
+        let count = 128
         let task = Task {
             try await OrderedRestorePipeline<Int>(policy: .init()).run(
+                estimatedBytes: Array(repeating: 1, count: count), shouldDrain: { false },
+                availableCapacity: { nil }, byteCount: { _ in 1 },
+                prepare: { index, worker in
+                    await probe.start(index, worker: worker)
+                    if index == 0 { await head.wait() }
+                    if index == count - 1 { prefetched.fulfill() }
+                    return index
+                },
+                commit: { _, result in await probe.commit(try result.get()) }
+            )
+        }
+        await fulfillment(of: [prefetched], timeout: 3)
+        let before = await probe.snapshot()
+        XCTAssertEqual(before.started, Set(0..<count))
+        XCTAssertTrue(before.committed.isEmpty)
+        XCTAssertEqual(Set(before.workerByItem.filter { $0.key != 0 }.values).count, 1)
+        await head.open()
+        try await task.value
+        let after = await probe.snapshot()
+        XCTAssertEqual(after.committed, Array(0..<count))
+        XCTAssertEqual(Set(after.workers), [0, 1])
+    }
+
+    func testByteBudgetBoundsLargePrefetchQueueUntilHeadFinalizes() async throws {
+        let head = RestoreTestLatch()
+        let full = expectation(description: "32 pending items fill the byte budget")
+        let probe = RestorePipelineProbe()
+        let task = Task {
+            try await OrderedRestorePipeline<Int>(policy: .init(bufferedByteLimit: 320)).run(
+                estimatedBytes: Array(repeating: 10, count: 64), shouldDrain: { false },
+                availableCapacity: { nil }, byteCount: { _ in 10 },
+                prepare: { index, worker in
+                    if index >= 32 {
+                        let state = await probe.snapshot()
+                        XCTAssertGreaterThanOrEqual(state.committed.count, index - 31)
+                    }
+                    await probe.start(index, worker: worker)
+                    if index == 0 { await head.wait() }
+                    if index == 31 { full.fulfill() }
+                    return index
+                },
+                commit: { _, result in _ = try result.get() },
+                finish: { index in await probe.commit(index) }
+            )
+        }
+        await fulfillment(of: [full], timeout: 3)
+        let before = await probe.snapshot()
+        XCTAssertEqual(before.started, Set(0..<32))
+        XCTAssertTrue(before.committed.isEmpty)
+        await head.open()
+        try await task.value
+        let after = await probe.snapshot()
+        XCTAssertEqual(after.committed, Array(0..<64))
+    }
+
+    func testOutOfOrderDownloadsCommitInOrderAndBoundLookahead() async throws {
+        let head = RestoreTestLatch()
+        let laterReady = expectation(description: "third download prefetched behind blocked head")
+        let probe = RestorePipelineProbe()
+        let task = Task {
+            try await OrderedRestorePipeline<Int>(policy: .init(bufferedItemLimit: 3)).run(
                 estimatedBytes: [1, 1, 1, 1], shouldDrain: { false }, availableCapacity: { nil }, byteCount: { _ in 1 },
                 prepare: { index, worker in
                     await probe.start(index, worker: worker)
                     if index == 0 { await head.wait() }
-                    if index == 1 { laterReady.fulfill() }
+                    if index == 2 { laterReady.fulfill() }
                     return index
                 },
                 commit: { _, result in await probe.commit(try result.get()) }
@@ -20,7 +82,7 @@ final class OrderedRestorePipelineTests: XCTestCase {
         }
         await fulfillment(of: [laterReady], timeout: 3)
         let before = await probe.snapshot()
-        XCTAssertEqual(before.started, [0, 1])
+        XCTAssertEqual(before.started, [0, 1, 2])
         XCTAssertEqual(before.committed, [])
         await head.open()
         try await task.value
@@ -54,6 +116,83 @@ final class OrderedRestorePipelineTests: XCTestCase {
         do { try await task.value; XCTFail("expected download failure") } catch RestorePipelineTestError.failed {}
         let after = await probe.snapshot()
         XCTAssertEqual(after.committed, [0])
+    }
+
+    func testWorkerContinuesPreparingWhilePhotosCommitIsBlocked() async throws {
+        let importing = RestoreTestLatch()
+        let releaseImport = RestoreTestLatch()
+        let prefetched = expectation(description: "worker reused during import")
+        let probe = RestorePipelineProbe()
+        let policy = RestoreDownloadPolicy(workerCount: 1, bufferedItemLimit: 3)
+        let task = Task {
+            try await OrderedRestorePipeline<Int>(policy: policy).run(
+                estimatedBytes: [1, 1, 1, 1], shouldDrain: { false }, availableCapacity: { nil }, byteCount: { _ in 1 },
+                prepare: { index, worker in
+                    await probe.start(index, worker: worker)
+                    if index == 1 { await importing.wait() }
+                    if index == 2 { prefetched.fulfill() }
+                    return index
+                },
+                commit: { index, result in
+                    if index == 0 {
+                        await importing.open()
+                        await releaseImport.wait()
+                    }
+                    await probe.commit(try result.get())
+                }
+            )
+        }
+        await fulfillment(of: [prefetched], timeout: 3)
+        let before = await probe.snapshot()
+        XCTAssertEqual(before.started, [0, 1, 2])
+        XCTAssertTrue(before.committed.isEmpty)
+        await releaseImport.open()
+        try await task.value
+        let after = await probe.snapshot()
+        XCTAssertEqual(after.committed, [0, 1, 2, 3])
+        XCTAssertEqual(Set(after.workers), [0])
+    }
+
+    func testQueuedReadyAssetsStillHoldByteBudgetDuringImport() async throws {
+        let releaseImport = RestoreTestLatch()
+        let bothPrepared = expectation(description: "byte budget filled")
+        let probe = RestorePipelineProbe()
+        let task = Task {
+            try await OrderedRestorePipeline<Int>(policy: .init(bufferedByteLimit: 10, bufferedItemLimit: 8)).run(
+                estimatedBytes: [5, 5, 5], shouldDrain: { false }, availableCapacity: { nil }, byteCount: { _ in 5 },
+                prepare: { index, worker in
+                    await probe.start(index, worker: worker)
+                    if index == 1 { bothPrepared.fulfill() }
+                    if index == 2 {
+                        let state = await probe.snapshot()
+                        XCTAssertFalse(state.committed.isEmpty)
+                    }
+                    return index
+                },
+                commit: { index, result in
+                    if index == 0 { await releaseImport.wait() }
+                    await probe.commit(try result.get())
+                }
+            )
+        }
+        await fulfillment(of: [bothPrepared], timeout: 3)
+        let before = await probe.snapshot()
+        XCTAssertEqual(before.started, [0, 1])
+        await releaseImport.open()
+        try await task.value
+    }
+
+    func testUnknownSizeDoesNotPrefetchUntilItsFinalizationCompletes() async throws {
+        let finalized = ExecutionTerminationControl()
+        try await OrderedRestorePipeline<Int>(policy: .init()).run(
+            estimatedBytes: [0, 1], shouldDrain: { false }, availableCapacity: { nil }, byteCount: { _ in 1 },
+            prepare: { index, _ in
+                if index == 1 { XCTAssertTrue(finalized.shouldDrain) }
+                return index
+            },
+            commit: { _, result in _ = try result.get() },
+            finish: { index in if index == 0 { finalized.request(.stop) } }
+        )
     }
 
     func testDrainCancelsPrefetchWhileFinishingHead() async throws {
@@ -112,6 +251,39 @@ final class OrderedRestorePipelineTests: XCTestCase {
         await fulfillment(of: [cancelled], timeout: 3)
     }
 
+    func testDrainDiscardsLargeReadyQueueAndFinalizesImportedHead() async throws {
+        let importing = RestoreTestLatch()
+        let releaseImport = RestoreTestLatch()
+        let full = expectation(description: "64 assets prepared while head import is blocked")
+        let drain = ExecutionTerminationControl()
+        let probe = RestorePipelineProbe()
+        let task = Task {
+            try await OrderedRestorePipeline<Int>(policy: .init()).run(
+                estimatedBytes: Array(repeating: 1, count: 64), shouldDrain: { drain.shouldDrain },
+                availableCapacity: { nil }, byteCount: { _ in 1 },
+                prepare: { index, worker in
+                    await probe.start(index, worker: worker)
+                    if index == 63 { full.fulfill() }
+                    return index
+                },
+                commit: { _, result in
+                    await importing.open()
+                    await releaseImport.wait()
+                    await probe.commit(try result.get())
+                },
+                finish: { index in XCTAssertEqual(index, 0) }
+            )
+        }
+        await fulfillment(of: [full], timeout: 3)
+        await importing.wait()
+        drain.request(.pause)
+        await releaseImport.open()
+        do { try await task.value; XCTFail("expected pause") } catch is CancellationError {}
+        let state = await probe.snapshot()
+        XCTAssertEqual(state.committed, [0])
+        XCTAssertEqual(state.started, Set(0..<64))
+    }
+
     func testFailureWaitsForCancelledPrefetchToSettle() async throws {
         let failHead = RestoreTestLatch()
         let releasePrefetch = RestoreTestLatch()
@@ -140,28 +312,92 @@ final class OrderedRestorePipelineTests: XCTestCase {
         XCTAssertTrue(returned.shouldDrain)
     }
 
-    func testOversizedAssetRunsAloneAndDoesNotDeadlock() async throws {
+    func testOversizedAssetAllowsNormalPrefetchWithinByteBudget() async throws {
+        let head = RestoreTestLatch()
+        let full = expectation(description: "ordinary byte budget filled beside oversized head")
         let probe = RestorePipelineProbe()
-        let policy = RestoreDownloadPolicy(workerCount: 2, bufferedByteLimit: 10, freeSpaceReserve: 0)
-        try await OrderedRestorePipeline<Int>(policy: policy).run(
-            estimatedBytes: [100, 2], shouldDrain: { false }, availableCapacity: { nil }, byteCount: { _ in 100 },
-            prepare: { index, worker in
-                if index == 1 {
-                    let state = await probe.snapshot()
-                    XCTAssertEqual(state.committed, [0])
-                }
-                await probe.start(index, worker: worker)
-                return index
-            },
-            commit: { _, result in await probe.commit(try result.get()) }
-        )
-        let state = await probe.snapshot()
-        XCTAssertEqual(state.committed, [0, 1])
+        let sizes: [Int64] = [100, 5, 5, 5]
+        let task = Task {
+            try await OrderedRestorePipeline<Int>(policy: .init(bufferedByteLimit: 10)).run(
+                estimatedBytes: sizes, shouldDrain: { false }, availableCapacity: { nil }, byteCount: { sizes[$0] },
+                prepare: { index, worker in
+                    await probe.start(index, worker: worker)
+                    if index == 0 { await head.wait() }
+                    if index == 2 { full.fulfill() }
+                    if index == 3 {
+                        let state = await probe.snapshot()
+                        XCTAssertTrue(state.committed.contains(1))
+                    }
+                    return index
+                },
+                commit: { _, result in await probe.commit(try result.get()) }
+            )
+        }
+        await fulfillment(of: [full], timeout: 3)
+        let before = await probe.snapshot()
+        XCTAssertEqual(before.started, [0, 1, 2])
+        XCTAssertTrue(before.committed.isEmpty)
+        await head.open()
+        try await task.value
+        let after = await probe.snapshot()
+        XCTAssertEqual(after.committed, [0, 1, 2, 3])
     }
 
-    func testCompletedActualSizePreventsFurtherPrefetch() async throws {
+    func testOversizedAssetsKeepWorkersUntilImportAndDoNotUseItemSlots() async throws {
+        let releaseImport = RestoreTestLatch()
+        let both = expectation(description: "two oversized assets prepared with only one ordinary item slot")
+        both.expectedFulfillmentCount = 2
+        let probe = RestorePipelineProbe()
+        let task = Task {
+            try await OrderedRestorePipeline<Int>(policy: .init(bufferedByteLimit: 10, bufferedItemLimit: 1)).run(
+                estimatedBytes: [100, 100, 100], shouldDrain: { false }, availableCapacity: { nil },
+                byteCount: { _ in 100 },
+                prepare: { index, worker in
+                    if index == 2 {
+                        let state = await probe.snapshot()
+                        XCTAssertTrue(state.committed.contains(0))
+                    }
+                    await probe.start(index, worker: worker)
+                    if index < 2 { both.fulfill() }
+                    return index
+                },
+                commit: { index, result in
+                    if index == 0 { await releaseImport.wait() }
+                    await probe.commit(try result.get())
+                }
+            )
+        }
+        await fulfillment(of: [both], timeout: 3)
+        let before = await probe.snapshot()
+        XCTAssertEqual(before.started, [0, 1])
+        await releaseImport.open()
+        try await task.value
+        let after = await probe.snapshot()
+        XCTAssertEqual(after.committed, [0, 1, 2])
+    }
+
+    func testOversizedAssetCanStartWhileOrdinaryItemSlotsAreFull() async throws {
         let head = RestoreTestLatch()
-        let prepared = expectation(description: "large second item prepared")
+        let large = expectation(description: "large asset admitted beyond ordinary item slot")
+        let sizes: [Int64] = [1, 100]
+        let task = Task {
+            try await OrderedRestorePipeline<Int>(policy: .init(bufferedByteLimit: 10, bufferedItemLimit: 1)).run(
+                estimatedBytes: sizes, shouldDrain: { false }, availableCapacity: { nil }, byteCount: { sizes[$0] },
+                prepare: { index, _ in
+                    if index == 0 { await head.wait() } else { large.fulfill() }
+                    return index
+                },
+                commit: { _, result in _ = try result.get() }
+            )
+        }
+        await fulfillment(of: [large], timeout: 3)
+        await head.open()
+        try await task.value
+    }
+
+    func testUnderestimatedOversizedAssetKeepsItsWorkerUntilImport() async throws {
+        let head = RestoreTestLatch()
+        let prepared = expectation(description: "underestimated second item prepared")
         let probe = RestorePipelineProbe()
         let task = Task {
             try await OrderedRestorePipeline<Int>(policy: .init(workerCount: 2, bufferedByteLimit: 10)).run(
@@ -170,30 +406,80 @@ final class OrderedRestorePipelineTests: XCTestCase {
                     if index == 1 { prepared.fulfill() }
                     return index == 1 ? 100 : 1
                 },
-                prepare: { index, _ in
-                    if index == 0 { await head.wait() }
+                prepare: { index, worker in
                     if index == 2 {
                         let state = await probe.snapshot()
-                        XCTAssertEqual(state.committed, [0, 1])
+                        XCTAssertEqual(worker, state.workerByItem[0])
                     }
+                    await probe.start(index, worker: worker)
+                    if index == 0 { await head.wait() }
                     return index
                 },
                 commit: { _, result in await probe.commit(try result.get()) }
             )
         }
         await fulfillment(of: [prepared], timeout: 3)
+        let before = await probe.snapshot()
+        XCTAssertEqual(before.started, [0, 1])
         await head.open()
         try await task.value
+        let after = await probe.snapshot()
+        XCTAssertEqual(after.committed, [0, 1, 2])
+    }
+
+    func testDrainStopsOversizedPrefetchAfterCurrentImport() async throws {
+        let releaseImport = RestoreTestLatch()
+        let importing = RestoreTestLatch()
+        let both = expectation(description: "both oversized downloads prepared")
+        both.expectedFulfillmentCount = 2
+        let drain = ExecutionTerminationControl()
+        let probe = RestorePipelineProbe()
+        let task = Task {
+            try await OrderedRestorePipeline<Int>(policy: .init(bufferedByteLimit: 10)).run(
+                estimatedBytes: [100, 100, 100], shouldDrain: { drain.shouldDrain }, availableCapacity: { nil },
+                byteCount: { _ in 100 },
+                prepare: { index, worker in
+                    await probe.start(index, worker: worker)
+                    both.fulfill()
+                    return index
+                },
+                commit: { index, result in
+                    await probe.commit(try result.get())
+                    XCTAssertEqual(index, 0)
+                    await importing.open()
+                    await releaseImport.wait()
+                }
+            )
+        }
+        await fulfillment(of: [both], timeout: 3)
+        await importing.wait()
+        drain.request(.pause)
+        await releaseImport.open()
+        do { try await task.value; XCTFail("expected pause") } catch is CancellationError {}
+        let state = await probe.snapshot()
+        XCTAssertEqual(state.started, [0, 1])
+        XCTAssertEqual(state.committed, [0])
     }
 
     func testSpaceAdmissionReservesImportRoomAndHandlesOverflow() {
         let policy = RestoreDownloadPolicy(workerCount: 2, bufferedByteLimit: 100, freeSpaceReserve: 10)
-        XCTAssertTrue(policy.admits(bytes: 200, reserved: [], available: 610))
-        XCTAssertFalse(policy.admits(bytes: 200, reserved: [], available: 609))
-        XCTAssertFalse(policy.admits(bytes: 60, reserved: [60], available: nil))
-        XCTAssertFalse(policy.admits(bytes: 0, reserved: [1], available: nil))
-        XCTAssertFalse(policy.admits(bytes: 1, reserved: [0], available: nil))
-        XCTAssertFalse(policy.admits(bytes: .max, reserved: [], available: 1_000))
+        func admits(bytes: Int64, reserved: [Int64], available: Int64?) -> Bool {
+            var reservations = RestoreReservations()
+            for (index, value) in reserved.enumerated() {
+                reservations.insert(index, bytes: value, oversized: policy.isOversized(value))
+            }
+            return policy.admits(bytes: bytes, reserved: reservations.snapshot, available: available)
+        }
+        XCTAssertTrue(admits(bytes: 200, reserved: [], available: 610))
+        XCTAssertFalse(admits(bytes: 200, reserved: [], available: 609))
+        XCTAssertTrue(admits(bytes: 50, reserved: [200], available: 660))
+        XCTAssertFalse(admits(bytes: 50, reserved: [200], available: 659))
+        XCTAssertTrue(admits(bytes: 200, reserved: [50], available: 660))
+        XCTAssertFalse(admits(bytes: 200, reserved: [50], available: 659))
+        XCTAssertFalse(admits(bytes: 60, reserved: [60], available: nil))
+        XCTAssertFalse(admits(bytes: 0, reserved: [1], available: nil))
+        XCTAssertFalse(admits(bytes: 1, reserved: [0], available: nil))
+        XCTAssertFalse(admits(bytes: .max, reserved: [], available: 1_000))
         XCTAssertEqual(RestoreDownloadPolicy.adding(.max, 1), .max)
     }
 
@@ -215,6 +501,33 @@ final class OrderedRestorePipelineTests: XCTestCase {
         )
         let state = await probe.snapshot()
         XCTAssertEqual(state.committed, [0, 1])
+    }
+
+    func testRepeatedCapacityBackpressureDoesNotLoseFinalizationWakeups() async throws {
+        let probe = RestorePipelineProbe()
+        let settled = expectation(description: "all tightly budgeted assets finalized")
+        let task = Task {
+            defer { settled.fulfill() }
+            try await OrderedRestorePipeline<Int>(policy: .init(bufferedByteLimit: 1)).run(
+                estimatedBytes: Array(repeating: 1, count: 300), shouldDrain: { false },
+                availableCapacity: { nil }, byteCount: { _ in 1 },
+                prepare: { index, _ in
+                    let state = await probe.snapshot()
+                    XCTAssertEqual(state.committed.count, index)
+                    return index
+                },
+                commit: { _, result in _ = try result.get() },
+                finish: { index in
+                    await Task.yield()
+                    await probe.commit(index)
+                }
+            )
+        }
+        await fulfillment(of: [settled], timeout: 5)
+        task.cancel()
+        try await task.value
+        let state = await probe.snapshot()
+        XCTAssertEqual(state.committed, Array(0..<300))
     }
 }
 
@@ -241,8 +554,11 @@ private actor RestorePipelineProbe {
     private var started: Set<Int> = []
     private var workers: [Int] = []
     private var committed: [Int] = []
+    private var workerByItem: [Int: Int] = [:]
 
-    func start(_ index: Int, worker: Int) { started.insert(index); workers.append(worker) }
+    func start(_ index: Int, worker: Int) { started.insert(index); workers.append(worker); workerByItem[index] = worker }
     func commit(_ index: Int) { committed.append(index) }
-    func snapshot() -> (started: Set<Int>, workers: [Int], committed: [Int]) { (started, workers, committed) }
+    func snapshot() -> (started: Set<Int>, workers: [Int], committed: [Int], workerByItem: [Int: Int]) {
+        (started, workers, committed, workerByItem)
+    }
 }
