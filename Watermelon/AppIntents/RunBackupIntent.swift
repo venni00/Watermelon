@@ -63,6 +63,8 @@ struct RunBackupIntent: LongRunningIntent, CancellableIntent {
     }
 
     func perform() async throws -> some IntentResult {
+        let shortcutSession = AppRuntimeFlags.beginShortcutSession()
+        defer { AppRuntimeFlags.endShortcutSession(shortcutSession) }
         try ShortcutsAccessStore.shared.checkEnabled()
         let selectedSource = try dataSource.resolve(albums: albums)
         let cancellation = BackupCancellationController()

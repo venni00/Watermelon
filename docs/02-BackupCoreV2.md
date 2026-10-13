@@ -22,6 +22,8 @@ iOS 27 的 `RunBackupIntent` 通过 `BackgroundBackupRunner.runOnDemand` 复用�
 
 `RunBackupIntent` 通过 `ShortcutsAccess` 检查快捷指令备份开关及 Pro 权益。免费用户可成功执行 5 次，失败或取消不扣次数；执行中临时占用一次额度，收尾成功才写入 `UserDefaults`。关闭开关后不再接受新的快捷指令备份；Pro 不消耗试用次数。计数只保存在 App 本机数据中，全新安装重新获得 5 次，不使用 Keychain 或服务端防重装机制。该限制不影响 `SetBackupNodeIntent`，后台自动备份仍单独要求 Pro。
 
+快捷指令在 `perform()` 入口登记 `AppRuntimeFlags` 会话，直到退出才释放，以便首页自动连接等待整个准备与执行过程。`runOnDemand` 通过 `enterExecutionAfterConnecting` 获得执行权：已有连接时登记可取消的等待请求，连接释放后原子交接 claim；等待也计入 `isExecuting`，防止其它执行或连接插入。已有执行或等待请求仍返回任务冲突。
+
 调用链：
 
 1. `HomeViewController.executeTapped()`

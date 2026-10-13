@@ -7,11 +7,23 @@ final class AppRuntimeFlags: @unchecked Sendable {
         fileprivate let token: UUID
     }
 
+    struct ShortcutSessionClaim: Sendable {
+        fileprivate let token: UUID
+    }
+
+    private struct PendingExecution {
+        let owner: ObjectIdentifier
+        let token: UUID
+        let continuation: CheckedContinuation<ExecutionClaim?, Error>
+    }
+
     @TaskLocal private static var profileMutationLeaseToken: UUID?
 
     private static let lock = NSLock()
     private static var executionOwner: ObjectIdentifier?
     private static var executionClaimToken: UUID?
+    private static var pendingExecution: PendingExecution?
+    private static var shortcutSessions: Set<UUID> = []
     private static var activeProfileMutationToken: UUID?
     private static var profileMutationDepth = 0
     private static var connectingProfileID: Int64?
@@ -19,7 +31,29 @@ final class AppRuntimeFlags: @unchecked Sendable {
     private static var connectingOwner: ObjectIdentifier?
 
     var isExecuting: Bool {
-        Self.lock.withLock { Self.executionOwner != nil }
+        Self.lock.withLock { Self.executionOwner != nil || Self.pendingExecution != nil }
+    }
+
+    static var hasActiveShortcutSession: Bool {
+        lock.withLock { !shortcutSessions.isEmpty }
+    }
+
+    static func beginShortcutSession() -> ShortcutSessionClaim {
+        let claim = ShortcutSessionClaim(token: UUID())
+        let didChange = lock.withLock {
+            let wasEmpty = shortcutSessions.isEmpty
+            shortcutSessions.insert(claim.token)
+            return wasEmpty
+        }
+        if didChange { NotificationCenter.default.post(name: .ShortcutSessionDidChange, object: nil) }
+        return claim
+    }
+
+    static func endShortcutSession(_ claim: ShortcutSessionClaim) {
+        let didChange = lock.withLock {
+            shortcutSessions.remove(claim.token) != nil && shortcutSessions.isEmpty
+        }
+        if didChange { NotificationCenter.default.post(name: .ShortcutSessionDidChange, object: nil) }
     }
 
     func isConnecting(profileID: Int64?) -> Bool {
@@ -32,6 +66,7 @@ final class AppRuntimeFlags: @unchecked Sendable {
         let owner = ObjectIdentifier(self)
         let claim: ExecutionClaim? = Self.lock.withLock {
             guard Self.executionOwner == nil,
+                  Self.pendingExecution == nil,
                   Self.activeProfileMutationToken == nil,
                   Self.connectingOwner == nil else { return nil }
             let token = UUID()
@@ -45,6 +80,70 @@ final class AppRuntimeFlags: @unchecked Sendable {
             object: self
         )
         return claim
+    }
+
+    func enterExecutionAfterConnecting() async throws -> ExecutionClaim? {
+        let token = UUID()
+        let owner = ObjectIdentifier(self)
+        let claim: ExecutionClaim? = try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { continuation in
+                let result: Result<ExecutionClaim?, Error>? = Self.lock.withLock {
+                    guard !Task.isCancelled else { return .failure(CancellationError()) }
+                    guard Self.executionOwner == nil, Self.pendingExecution == nil else {
+                        return .success(nil)
+                    }
+                    if Self.connectingOwner != nil {
+                        Self.pendingExecution = PendingExecution(
+                            owner: owner, token: token, continuation: continuation
+                        )
+                        return nil
+                    }
+                    guard Self.activeProfileMutationToken == nil else { return .success(nil) }
+                    Self.executionOwner = owner
+                    Self.executionClaimToken = token
+                    return .success(ExecutionClaim(token: token))
+                }
+                if let result {
+                    if case .success(.some) = result {
+                        NotificationCenter.default.post(name: .ExecutionLifecycleDidChange, object: self)
+                    }
+                    continuation.resume(with: result)
+                } else {
+                    NotificationCenter.default.post(name: .ExecutionLifecycleDidChange, object: self)
+                }
+            }
+        } onCancel: {
+            let pending = Self.lock.withLock {
+                guard Self.pendingExecution?.token == token else { return Optional<PendingExecution>.none }
+                let pending = Self.pendingExecution
+                Self.pendingExecution = nil
+                return pending
+            }
+            if let pending {
+                pending.continuation.resume(throwing: CancellationError())
+                NotificationCenter.default.post(name: .ExecutionLifecycleDidChange, object: self)
+            }
+        }
+        if Task.isCancelled {
+            if let claim { exitExecution(claim) }
+            throw CancellationError()
+        }
+        return claim
+    }
+
+    private static func takeReadyPendingExecutionLocked() -> PendingExecution? {
+        // Reserve the handoff before other connection requests can observe an idle runtime.
+        guard executionOwner == nil, connectingOwner == nil, activeProfileMutationToken == nil,
+              let pending = pendingExecution else { return nil }
+        pendingExecution = nil
+        executionOwner = pending.owner
+        executionClaimToken = pending.token
+        return pending
+    }
+
+    private static func resumePendingExecution(_ pending: PendingExecution?) {
+        guard let pending else { return }
+        pending.continuation.resume(returning: ExecutionClaim(token: pending.token))
     }
 
     // Scope form of the execution mutex for self-contained one-shot work: claim, run, release (even on throw).
@@ -96,11 +195,13 @@ final class AppRuntimeFlags: @unchecked Sendable {
     }
 
     @discardableResult
-    func tryBeginConnecting(profileID: Int64?) -> Bool {
+    func tryBeginConnecting(profileID: Int64?, isAutomatic: Bool = false) -> Bool {
         guard let profileID else { return false }
         let owner = ObjectIdentifier(self)
         let didChange = Self.lock.withLock {
             guard Self.executionOwner == nil,
+                  Self.pendingExecution == nil,
+                  !isAutomatic || Self.shortcutSessions.isEmpty,
                   Self.activeProfileMutationToken == nil,
                   Self.connectingOwner == nil ||
                     (Self.connectingOwner == owner && Self.connectingEphemeralID == nil) else { return false }
@@ -121,6 +222,7 @@ final class AppRuntimeFlags: @unchecked Sendable {
         let owner = ObjectIdentifier(self)
         let didChange = Self.lock.withLock {
             guard Self.executionOwner == nil,
+                  Self.pendingExecution == nil,
                   Self.activeProfileMutationToken == nil,
                   Self.connectingOwner == nil else { return false }
             Self.connectingProfileID = nil
@@ -137,28 +239,30 @@ final class AppRuntimeFlags: @unchecked Sendable {
     func endConnecting(profileID: Int64?) {
         guard let profileID else { return }
         let owner = ObjectIdentifier(self)
-        let didChange = Self.lock.withLock {
-            guard Self.connectingProfileID == profileID, Self.connectingOwner == owner else { return false }
+        let released: (didChange: Bool, pending: PendingExecution?) = Self.lock.withLock {
+            guard Self.connectingProfileID == profileID, Self.connectingOwner == owner else { return (false, nil) }
             Self.connectingProfileID = nil
             Self.connectingEphemeralID = nil
             Self.connectingOwner = nil
-            return true
+            return (true, Self.takeReadyPendingExecutionLocked())
         }
-        if didChange {
+        Self.resumePendingExecution(released.pending)
+        if released.didChange {
             NotificationCenter.default.post(name: .ConnectionLifecycleDidChange, object: self)
         }
     }
 
     func endEphemeralConnecting(sessionID: String) {
         let owner = ObjectIdentifier(self)
-        let didChange = Self.lock.withLock {
-            guard Self.connectingEphemeralID == sessionID, Self.connectingOwner == owner else { return false }
+        let released: (didChange: Bool, pending: PendingExecution?) = Self.lock.withLock {
+            guard Self.connectingEphemeralID == sessionID, Self.connectingOwner == owner else { return (false, nil) }
             Self.connectingProfileID = nil
             Self.connectingEphemeralID = nil
             Self.connectingOwner = nil
-            return true
+            return (true, Self.takeReadyPendingExecutionLocked())
         }
-        if didChange {
+        Self.resumePendingExecution(released.pending)
+        if released.didChange {
             NotificationCenter.default.post(name: .ConnectionLifecycleDidChange, object: self)
         }
     }
@@ -178,8 +282,9 @@ final class AppRuntimeFlags: @unchecked Sendable {
                 Self.executionOwner = nil
                 Self.executionClaimToken = nil
             }
-            return (connection: releasedConnection, execution: releasedExecution)
+            return (connection: releasedConnection, execution: releasedExecution, pending: Self.takeReadyPendingExecutionLocked())
         }
+        Self.resumePendingExecution(released.pending)
         if released.connection {
             NotificationCenter.default.post(name: .ConnectionLifecycleDidChange, object: nil)
         }
@@ -205,18 +310,23 @@ final class AppRuntimeFlags: @unchecked Sendable {
     }
 
     private static func releaseProfileMutationLease(token: UUID) {
-        lock.withLock {
-            guard activeProfileMutationToken == token, profileMutationDepth > 0 else { return }
+        let released: (didEnd: Bool, pending: PendingExecution?) = lock.withLock {
+            guard activeProfileMutationToken == token, profileMutationDepth > 0 else { return (false, nil) }
             profileMutationDepth -= 1
-            if profileMutationDepth == 0 {
-                activeProfileMutationToken = nil
-            }
+            guard profileMutationDepth == 0 else { return (false, nil) }
+            activeProfileMutationToken = nil
+            return (true, takeReadyPendingExecutionLocked())
         }
+        resumePendingExecution(released.pending)
+        if released.didEnd { NotificationCenter.default.post(name: .ProfileMutationLeaseDidEnd, object: nil) }
     }
 
     #if DEBUG
     static func _testReset() {
-        lock.withLock {
+        let pending = lock.withLock {
+            let pending = pendingExecution
+            pendingExecution = nil
+            shortcutSessions = []
             executionOwner = nil
             executionClaimToken = nil
             activeProfileMutationToken = nil
@@ -224,7 +334,9 @@ final class AppRuntimeFlags: @unchecked Sendable {
             connectingProfileID = nil
             connectingEphemeralID = nil
             connectingOwner = nil
+            return pending
         }
+        pending?.continuation.resume(throwing: CancellationError())
     }
     #endif
 }

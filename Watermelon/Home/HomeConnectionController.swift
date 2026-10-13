@@ -1,5 +1,6 @@
 import Foundation
 import os
+import UIKit
 
 // Hands out a monotonic sequence stamped at progress-emission time (before the main-actor hop), so the
 // sink can apply frames in emission order regardless of Task delivery order.
@@ -18,7 +19,7 @@ private final class ProgressSequencer: @unchecked Sendable {
 final class HomeConnectionController {
 
     private let dependencies: DependencyContainer
-    private var didAttemptAutoConnect = false
+    private let applicationState: () -> UIApplication.State
     private var connectingProfile: ServerProfileRecord?
     private var connectTask: Task<Void, Never>?
     private var remoteRefreshTask: Task<Void, Never>?
@@ -43,6 +44,7 @@ final class HomeConnectionController {
     private var lastProgressEpoch: UInt64 = 0
     private var lastProgressSequence: UInt64 = 0
     private var isAutoConnectSuppressedForBrowserLink = false
+    private var isAutoConnectSuperseded = false
 
     var onStateChanged: (() -> Void)?
     var onProfilesChanged: (() -> Void)?
@@ -51,8 +53,12 @@ final class HomeConnectionController {
     var onNeedsSFTPHostKeyTrust: ((ServerProfileRecord, SFTPHostKeyPromptPolicy.Decision, String) async -> Bool)?
     var onConnectFailed: ((ServerProfileRecord, Error) -> Void)?
 
-    init(dependencies: DependencyContainer) {
+    init(
+        dependencies: DependencyContainer,
+        applicationState: @escaping () -> UIApplication.State = { UIApplication.shared.applicationState }
+    ) {
         self.dependencies = dependencies
+        self.applicationState = applicationState
         dependencies.appSession.onSessionChanged = { [weak self] _ in
             guard let self else { return }
             self.loadProfiles()
@@ -68,6 +74,7 @@ final class HomeConnectionController {
         profile: ServerProfileRecord,
         completion: @escaping (Result<Void, Error>) -> Void
     ) {
+        isAutoConnectSuperseded = true
         let sessionID = profile.credentialRef
         guard dependencies.appRuntimeFlags.tryBeginEphemeralConnecting(sessionID: sessionID) else {
             completion(.failure(RemoteStorageClientError.unavailable))
@@ -142,28 +149,32 @@ final class HomeConnectionController {
         isAutoConnectSuppressedForBrowserLink = true
     }
 
-    func attemptAutoConnect() {
-        guard !didAttemptAutoConnect, !isAutoConnectSuppressedForBrowserLink else { return }
-        didAttemptAutoConnect = true
+    func attemptAutoConnect() -> HomeAutoConnectCoordinator.AttemptResult {
+        guard !isAutoConnectSuppressedForBrowserLink, !isAutoConnectSuperseded else { return .finished }
+        guard !AppRuntimeFlags.hasActiveShortcutSession,
+              applicationState() == .active,
+              !dependencies.appRuntimeFlags.isExecuting else { return .deferred }
+        guard connectingProfile == nil, dependencies.appSession.activeProfile == nil else { return .finished }
 
         let activeID = try? dependencies.databaseManager.activeServerProfileID()
         guard let activeID,
               let profile = savedProfiles.first(where: { $0.id == activeID }) else {
-            return
+            return .finished
         }
 
         if profile.storageProfile.requiresStoredCredential {
             guard let password = try? dependencies.keychainService.readPassword(account: profile.credentialRef) else {
-                return
+                return .finished
             }
             try? dependencies.keychainService.save(password: password, account: profile.credentialRef)
-            connect(profile: profile, password: password, reportFailure: false)
+            return connect(profile: profile, password: password, reportFailure: false, isAutomatic: true) ? .finished : .deferred
         } else {
-            connect(profile: profile, password: "", reportFailure: false)
+            return connect(profile: profile, password: "", reportFailure: false, isAutomatic: true) ? .finished : .deferred
         }
     }
 
     func promptAndConnect(profile: ServerProfileRecord) {
+        isAutoConnectSuperseded = true
         // Re-tapping the profile already connecting is a no-op; tapping a different one supersedes it.
         guard connectingProfile?.id != profile.id else { return }
 
@@ -190,6 +201,7 @@ final class HomeConnectionController {
     }
 
     func disconnect() {
+        isAutoConnectSuperseded = true
         let wasBrowserLink = connectingProfile?.isBrowserLinkProfile == true ||
             dependencies.appSession.activeProfile?.isBrowserLinkProfile == true
         let ephemeralSessionID = connectingProfile?.isBrowserLinkProfile == true
@@ -281,17 +293,23 @@ final class HomeConnectionController {
 
     // MARK: - Internal
 
-    private func connect(profile: ServerProfileRecord, password: String, reportFailure: Bool = true) {
-        guard connectingProfile?.id != profile.id else { return }
+    @discardableResult
+    private func connect(
+        profile: ServerProfileRecord,
+        password: String,
+        reportFailure: Bool = true,
+        isAutomatic: Bool = false
+    ) -> Bool {
+        guard connectingProfile?.id != profile.id else { return false }
         guard dependencies.appSession.activeProfile?.isBrowserLinkProfile != true else {
             if reportFailure { onConnectFailed?(profile, RemoteStorageClientError.unavailable) }
-            return
+            return false
         }
-        guard dependencies.appRuntimeFlags.tryBeginConnecting(profileID: profile.id) else {
+        guard dependencies.appRuntimeFlags.tryBeginConnecting(profileID: profile.id, isAutomatic: isAutomatic) else {
             if reportFailure {
                 onConnectFailed?(profile, RemoteStorageClientError.unavailable)
             }
-            return
+            return false
         }
         // A connect supersedes any in-flight connect (switching off a slow node) and background remote refresh.
         connectTask?.cancel()
@@ -445,6 +463,7 @@ final class HomeConnectionController {
                 }
             }
         }
+        return true
     }
 
     func adoptPersistedConnectionProfile(_ profile: ServerProfileRecord) {

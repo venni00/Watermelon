@@ -72,13 +72,17 @@
 
 职责：
 
-1. 聚合 Home 子组件：`HomeIncrementalDataManager`、`HomeConnectionController`、`HomeExecutionCoordinator`、`PiPExecutionBridge`、`HomeScopeController`、`HomeScopeNormalizer`、`HomeSectionBuilder`、`HomePhotoAccessGate`，以及 lazy 构造的 `HomeRefreshScheduler`、`HomeSelectionController`
+1. 聚合 Home 子组件：`HomeIncrementalDataManager`、`HomeConnectionController`、`HomeExecutionCoordinator`、`PiPExecutionBridge`、`HomeScopeController`、`HomeScopeNormalizer`、`HomeSectionBuilder`、`HomePhotoAccessGate`，以及 lazy 构造的 `HomeRefreshScheduler`、`HomeSelectionController`、`HomeAutoConnectCoordinator`
 2. 维护首页渲染所需状态：`sections`、`rowLookup`、`selection`、`localPhotoAccessState`、`localLibraryScope`、`isReloadingScope`
 3. 对外暴露 `connectionState` 与 `executionState`，以及综合判断 `isSelectable`（要求已连接、已授权相册、不在执行态、不在 scope 重载、不在远端 maintenance）
 4. 把内部状态变化统一映射为 `HomeChangeKind`
 5. 串行合并 `reloadLocal / syncRemote / notifyConnection / notifyStructural` 等刷新任务（由 `HomeRefreshScheduler` 执行）
 6. 订阅 `LocalIndexChangePublisher` 与 `RemoteMaintenanceController`，把索引构建 / 校验事件转成 `.structural` 通知
 7. 在 `load / reloadProfiles / connect / disconnect` 等 profile 集合或 active profile 变化处把最新数据推给 `ProfileReachabilityService`；其 `onChange` 回调会被合并成一次 `.notifyConnection` 刷新，让目标菜单重新渲染 `离线` 标记
+
+### `HomeAutoConnectCoordinator`
+
+保存首页初始化后的自动连接请求，区分等待初始化、待处理、尝试中与已完成。监听 App 激活、快捷指令会话结束、执行与连接释放、维护和配置修改结束，条件满足时继续同一请求；同步连接通知不会造成重入，已经开始或被用户操作替代的自动连接不再重试。
 
 ### `HomeConnectionController`
 

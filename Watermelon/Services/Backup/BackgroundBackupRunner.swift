@@ -175,10 +175,11 @@ final class BackgroundBackupRunner {
         onEvent: @escaping @Sendable (BackupEvent) async -> Void
     ) async throws -> BackupExecutionResult {
         try Task.checkCancellation()
-        guard let claim = appRuntimeFlags.tryEnterExecution() else {
+        guard let claim = try await appRuntimeFlags.enterExecutionAfterConnecting() else {
             throw BackgroundBackupRunError(message: String(localized: "mediaBrowser.action.taskInProgress"))
         }
         defer { appRuntimeFlags.exitExecution(claim) }
+        try Task.checkCancellation()
         guard let profile = try databaseManager.fetchServerProfile(id: profileID) else {
             throw BackgroundBackupRunError(message: String(localized: "backgroundBackup.intent.result.notFound"))
         }

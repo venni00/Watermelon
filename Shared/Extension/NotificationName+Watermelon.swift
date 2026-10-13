@@ -2,6 +2,8 @@ import Foundation
 
 extension Notification.Name {
     static let ExecutionLifecycleDidChange = Notification.Name(rawValue: "com.zizicici.watermelon.execution.lifecycle.changed")
+    static let ShortcutSessionDidChange = Notification.Name(rawValue: "com.zizicici.watermelon.shortcut.session.changed")
+    static let ProfileMutationLeaseDidEnd = Notification.Name(rawValue: "com.zizicici.watermelon.profile.mutation.ended")
     static let ConnectionLifecycleDidChange = Notification.Name(rawValue: "com.zizicici.watermelon.connection.lifecycle.changed")
     static let LocalIndexBuildStateDidChange = Notification.Name(rawValue: "com.zizicici.watermelon.localIndexBuild.state.changed")
     static let RemoteMaintenanceDidChange = Notification.Name(rawValue: "com.zizicici.watermelon.remote.maintenance.changed")

@@ -22,6 +22,14 @@ final class HomeScreenStore {
     private lazy var localIndexReloadCoordinator = makeLocalIndexReloadCoordinator()
     private lazy var refreshScheduler = makeRefreshScheduler()
     private lazy var selectionController = makeSelectionController()
+    private lazy var autoConnectCoordinator = HomeAutoConnectCoordinator(hooks: .init(
+        isReady: { [weak self] in
+            guard let self else { return false }
+            return !self.isBrowserLinkPairingActive && !self.isBrowserLinkTransportActive
+                && !self.isExecutionActive && !self.isMaintenanceBlocked
+        },
+        attempt: { [weak self] in self?.connectionController.attemptAutoConnect() ?? .finished }
+    ))
 
     private let dependencies: DependencyContainer
 
@@ -51,7 +59,6 @@ final class HomeScreenStore {
     private(set) var isRemoteMaintenanceActive: Bool = false
     private var isBrowserLinkPairingActive = false
     private var isBrowserLinkTransportActive = false
-    private var isBootstrapReadyForAutoConnect = false
 
     // False between connect/switch and the sync that applies the new connection's snapshot.
     private(set) var isRemoteReady: Bool = false
@@ -103,18 +110,13 @@ final class HomeScreenStore {
     func setBrowserLinkSessionActive(_ isActive: Bool) {
         guard isBrowserLinkPairingActive != isActive else { return }
         isBrowserLinkPairingActive = isActive
+        autoConnectCoordinator.resumeIfPossible()
     }
 
     func setBrowserLinkTransportActive(_ isActive: Bool) {
         guard isBrowserLinkTransportActive != isActive else { return }
         isBrowserLinkTransportActive = isActive
-    }
-
-    private func attemptAutoConnectIfAllowed() {
-        guard isBootstrapReadyForAutoConnect,
-              !isBrowserLinkPairingActive,
-              !isBrowserLinkTransportActive else { return }
-        connectionController.attemptAutoConnect()
+        autoConnectCoordinator.resumeIfPossible()
     }
 
     func reachability(for profileID: Int64) -> ProfileReachabilityService.Reachability {
@@ -500,7 +502,6 @@ final class HomeScreenStore {
         connectionController.loadProfiles()
         pushProfilesToReachabilityService()
         bootstrapTask?.cancel()
-        isBootstrapReadyForAutoConnect = false
         bootstrapTask = Task { @MainActor [weak self] in
             guard let self else { return }
             if !self.localIndexReloadCoordinator.deferIfBlocked([.reloadLocal, .notifyStructural]) {
@@ -508,8 +509,7 @@ final class HomeScreenStore {
             }
             guard !Task.isCancelled else { return }
             _ = self.refreshLocalPhotoAccessState()
-            self.isBootstrapReadyForAutoConnect = true
-            self.attemptAutoConnectIfAllowed()
+            self.autoConnectCoordinator.request()
             // Don't call syncRemoteDataIfNeeded here — if auto-connect is in progress,
             // connectionState is .connecting and hasActiveConnection would be false,
             // which would clear remote data and advance revision, corrupting the bootstrap.
