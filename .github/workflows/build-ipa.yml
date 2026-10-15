@@ -1,0 +1,59 @@
+
+name: Build Watermelon Unsigned IPA
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+
+jobs:
+  build:
+    runs-on: macos-latest
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Show Xcode version
+        run: xcodebuild -version
+
+      - name: Build Watermelon for iPhone
+        run: |
+          xcodebuild \
+            -project Watermelon.xcodeproj \
+            -scheme Watermelon \
+            -configuration Release \
+            -sdk iphoneos \
+            -destination 'generic/platform=iOS' \
+            -derivedDataPath build \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            build
+
+      - name: Package unsigned IPA
+        run: |
+          mkdir -p Payload
+
+          APP="build/Build/Products/Release-iphoneos/Watermelon.app"
+
+          test -d "$APP" || exit 1
+
+          cp -R "$APP" Payload/
+
+          # Remove any existing code signatures
+          find Payload -name _CodeSignature \
+            -type d -prune -exec rm -rf {} +
+
+          zip -qry Watermelon-unsigned.ipa Payload
+
+          unzip -t Watermelon-unsigned.ipa
+
+      - name: Upload IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: Watermelon-unsigned-IPA
+          path: Watermelon-unsigned.ipa
+          retention-days: 30
+          if-no-files-found: error
