@@ -2,6 +2,9 @@
 name: Build Watermelon Unsigned IPA
 
 on:
+  push:
+    branches:
+      - main
   workflow_dispatch:
 
 permissions:
@@ -9,22 +12,31 @@ permissions:
 
 jobs:
   build:
-    runs-on: macos-latest
+    name: Build unsigned IPA
+    runs-on: xcode-27
     timeout-minutes: 60
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Show Xcode version
-        run: xcodebuild -version
+      - name: Check Xcode and iOS SDK
+        shell: bash
+        run: |
+          echo "Xcode version:"
+          xcodebuild -version
+
+          echo "iOS SDK version:"
+          xcrun --sdk iphoneos --show-sdk-version
+
+          echo "Runner architecture:"
+          uname -m
 
       - name: Build Watermelon for iPhone
         shell: bash
         run: |
           echo "Building Watermelon..."
 
-          # Capture output instead of printing thousands of lines
           xcodebuild \
             -quiet \
             -project Watermelon.xcodeproj \
@@ -41,13 +53,14 @@ jobs:
           RESULT=$?
 
           if [ "$RESULT" -ne 0 ]; then
-            echo "::group::Xcode build errors"
+            echo "::group::Build errors"
 
-            grep -n -i -E -A 5 -B 2 \
+            grep -n -i -E -A 4 -B 2 \
               'error:|fatal error|BUILD FAILED|failed to|SwiftCompile failed' \
               build.log | tail -100 || true
 
             echo "::endgroup::"
+
             echo "::error::Xcode build failed (exit $RESULT)"
             exit "$RESULT"
           fi
@@ -66,7 +79,7 @@ jobs:
       - name: Package unsigned IPA
         shell: bash
         run: |
-          echo "Packaging unsigned IPA..."
+          echo "Packaging Watermelon..."
 
           APP="build/Build/Products/Release-iphoneos/Watermelon.app"
 
@@ -83,15 +96,16 @@ jobs:
             -prune -exec rm -rf {} +
 
           # Remove provisioning profiles
-          find Payload -name embedded.mobileprovision \
-            -type f -delete
+          find Payload -type f \
+            -name embedded.mobileprovision -delete
 
+          # Create IPA
           zip -qry Watermelon-unsigned.ipa Payload
 
-          echo "Verifying IPA..."
+          # Verify archive
           unzip -tq Watermelon-unsigned.ipa
 
-          echo "IPA created:"
+          echo "IPA created successfully:"
           ls -lh Watermelon-unsigned.ipa
 
       - name: Upload unsigned IPA
