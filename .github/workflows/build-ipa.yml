@@ -3,8 +3,9 @@ name: Build Watermelon Unsigned IPA
 
 on:
   workflow_dispatch:
-  push:
-    branches: [main]
+
+permissions:
+  contents: read
 
 jobs:
   build:
@@ -12,15 +13,20 @@ jobs:
     timeout-minutes: 60
 
     steps:
-      - name: Checkout
+      - name: Checkout repository
         uses: actions/checkout@v4
 
       - name: Show Xcode version
         run: xcodebuild -version
 
       - name: Build Watermelon for iPhone
+        shell: bash
         run: |
+          echo "Building Watermelon..."
+
+          # Capture output instead of printing thousands of lines
           xcodebuild \
+            -quiet \
             -project Watermelon.xcodeproj \
             -scheme Watermelon \
             -configuration Release \
@@ -30,30 +36,68 @@ jobs:
             CODE_SIGNING_ALLOWED=NO \
             CODE_SIGNING_REQUIRED=NO \
             CODE_SIGN_IDENTITY="" \
-            build
+            build > build.log 2>&1
+
+          RESULT=$?
+
+          if [ "$RESULT" -ne 0 ]; then
+            echo "::group::Xcode build errors"
+
+            grep -n -i -E -A 5 -B 2 \
+              'error:|fatal error|BUILD FAILED|failed to|SwiftCompile failed' \
+              build.log | tail -100 || true
+
+            echo "::endgroup::"
+            echo "::error::Xcode build failed (exit $RESULT)"
+            exit "$RESULT"
+          fi
+
+          echo "Build succeeded!"
+
+      - name: Upload build log on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: Watermelon-Build-Log
+          path: build.log
+          retention-days: 7
+          if-no-files-found: warn
 
       - name: Package unsigned IPA
+        shell: bash
         run: |
-          mkdir -p Payload
+          echo "Packaging unsigned IPA..."
 
           APP="build/Build/Products/Release-iphoneos/Watermelon.app"
 
-          test -d "$APP" || exit 1
+          if [ ! -d "$APP" ]; then
+            echo "::error::Watermelon.app not found"
+            exit 1
+          fi
 
+          mkdir -p Payload
           cp -R "$APP" Payload/
 
-          # Remove any existing code signatures
-          find Payload -name _CodeSignature \
-            -type d -prune -exec rm -rf {} +
+          # Remove existing signatures
+          find Payload -type d -name _CodeSignature \
+            -prune -exec rm -rf {} +
+
+          # Remove provisioning profiles
+          find Payload -name embedded.mobileprovision \
+            -type f -delete
 
           zip -qry Watermelon-unsigned.ipa Payload
 
-          unzip -t Watermelon-unsigned.ipa
+          echo "Verifying IPA..."
+          unzip -tq Watermelon-unsigned.ipa
 
-      - name: Upload IPA
+          echo "IPA created:"
+          ls -lh Watermelon-unsigned.ipa
+
+      - name: Upload unsigned IPA
         uses: actions/upload-artifact@v4
         with:
-          name: Watermelon-unsigned-IPA
+          name: Watermelon-Unsigned-IPA
           path: Watermelon-unsigned.ipa
           retention-days: 30
           if-no-files-found: error
